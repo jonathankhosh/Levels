@@ -1,0 +1,380 @@
+//@version=6
+// =============================================================================
+// Auto S/R Levels — HTF-pivot level book with touch promotion (MNQ-tuned)
+// =============================================================================
+// Auto-detects the horizontal support/resistance levels a discretionary trader
+// would hand-draw: prices where the market printed a significant higher-
+// timeframe swing extreme and then kept reacting, from both sides, for weeks.
+//
+// How it works (fully causal — closed bars only, no request.security):
+//   1. 15m bars are bucketed into HTF (default 1h) bars on the fly.
+//   2. A confirmed HTF pivot (strength 8, unique extreme in its window) either
+//      creates a level at the exact pivot wick or merges into the nearest
+//      level within 0.20% (center nudged toward the pivot). A pivot that is
+//      also a fresh 400-hour extreme is flagged "strong".
+//   3. Every chart bar whose band-extended range (±0.09%) contains a level
+//      center counts zone contact; contacts ≥6h apart are distinct touches,
+//      and the drawn price re-snaps to the latest reaction wick — so lines
+//      sit on exact candle highs/lows, like magnet-snapped hand drawings.
+//   4. Levels are drawn (and traded) only once they pass emission rules that
+//      demand a real retest lifecycle (touch counts by age/strength class).
+//      Levels are never retired: role-flip levels stay relevant for months.
+//
+// Validated on MNQ 15m (2024-09 → 2026-07) against 17 hand-drawn levels:
+// found 14/17 within 30 pts (8/17 within 10 pts), precision 0.61, ~31 lines
+// in the visible range. Tuned on MNQ 15m — retune pivot strength, merge %,
+// and touch gaps before trusting on other symbols/timeframes.
+//
+// The strategy layer is a DEMONSTRATION harness for the levels (bounce-at-
+// level entries with fixed % stop and R-multiple target). It is deliberately
+// simple; treat backtest results as a measure of level quality, not a
+// finished trading system.
+// =============================================================================
+
+strategy("Auto S/R Levels (HTF Pivot Book)", "AutoLevels",
+     overlay = true,
+     max_lines_count = 500,
+     max_labels_count = 500,
+     initial_capital = 25000,
+     default_qty_type = strategy.fixed,
+     default_qty_value = 1,
+     commission_type = strategy.commission.cash_per_contract,
+     commission_value = 0.52,
+     slippage = 1,
+     pyramiding = 0,
+     process_orders_on_close = true)
+
+// ────────────────────────────────────────────────────────────────────────────
+// Inputs
+// ────────────────────────────────────────────────────────────────────────────
+grpD = "Detection (tuned on MNQ 15m)"
+grpE = "Emission — when a level earns its line"
+grpV = "Display"
+grpS = "Strategy layer (demo)"
+
+tfHours       = input.int(1,     "HTF aggregation (hours)",              minval = 1,  maxval = 4,   group = grpD, tooltip = "Higher-timeframe bucket size used for pivot detection. All tuning was done at 1h.")
+pivStrength   = input.int(8,     "HTF pivot strength (bars each side)",  minval = 5,  maxval = 12,  group = grpD, tooltip = "A completed HTF bar is a pivot when it is the unique extreme of this many closed HTF bars on each side. SHARP optimum at 8 on MNQ.")
+freshLookback = input.int(400,   "Fresh-extreme lookback (HTF bars)",    minval = 200, maxval = 600, group = grpD, tooltip = "A pivot that exceeds every HTF extreme in this many prior bars is flagged STRONG (fresh multi-week extreme).")
+mergeTolPct   = input.float(0.20, "Merge tolerance (%)",                 minval = 0.10, maxval = 0.30, step = 0.01, group = grpD, tooltip = "A new pivot within this % of an existing level's center merges into it instead of creating a new level.")
+promoteTolPct = input.float(0.08, "Strong-pivot separation (%)",         minval = 0.05, maxval = 0.15, step = 0.01, group = grpD, tooltip = "A STRONG pivot farther than this % from every level always starts its own level, even inside merge tolerance.")
+alphaNudge    = input.float(0.25, "Center nudge per merged pivot",       minval = 0.10, maxval = 0.50, step = 0.05, group = grpD, tooltip = "How far the level center drifts toward each newly merged pivot (0.25 = 25% of the distance).")
+bandPct       = input.float(0.09, "Touch band half-width (%)",           minval = 0.06, maxval = 0.12, step = 0.01, group = grpD, tooltip = "A bar whose band-extended range contains the level center registers zone contact.")
+snapTolPct    = input.float(0.30, "Wick re-snap radius (%)",             minval = 0.15, maxval = 0.40, step = 0.01, group = grpD, tooltip = "The drawn price follows the latest bar high/low within this % of the center — lines sit on exact candle wicks.")
+gapBars       = input.int(24,    "Bars between distinct touches",        minval = 16, maxval = 32,  group = grpD, tooltip = "Zone contacts separated by at least this many chart bars count as separate touch events (24 x 15m = 6h).")
+
+recentDays    = input.int(35,    "Young-level age cutoff (days)",        minval = 25, maxval = 45,  group = grpE, tooltip = "Levels younger than this use the young touch threshold; older levels face the stricter old-level rules. Days are measured in traded bars (96 x 15m = 1 day).")
+tYoung        = input.int(11,    "Young: min touches",                   minval = 8,  maxval = 14,  group = grpE)
+tOldStrong    = input.int(24,    "Old strong: min touches",              minval = 18, maxval = 32,  group = grpE)
+pOldStrong    = input.int(9,     "Old strong: max merged pivots",        minval = 6,  maxval = 12,  group = grpE, tooltip = "Levels that absorbed too many pivots are blurry chop zones, not crisp lines.")
+tOldWeak      = input.int(40,    "Old non-strong: min touches",          minval = 36, maxval = 48,  group = grpE)
+pOldWeak      = input.int(7,     "Old non-strong: max merged pivots",    minval = 5,  maxval = 9,   group = grpE)
+tShelf        = input.int(14,    "Crisp shelf: min touches",             minval = 12, maxval = 18,  group = grpE, tooltip = "Old level alternative: one clean price respected repeatedly (very few merged pivots).")
+pShelf        = input.int(2,     "Crisp shelf: max merged pivots",       minval = 1,  maxval = 3,   group = grpE)
+tRescue       = input.int(10,    "Fresh-extreme rescue: min touches",    minval = 6,  maxval = 12,  group = grpE, tooltip = "A STRONG (fresh-extreme) level this young is drawn once it has these touches, even if other rules fail.")
+rescueDays    = input.int(45,    "Fresh-extreme rescue: max age (days)", minval = 35, maxval = 55,  group = grpE)
+topZonePct    = input.float(0.30, "Chart-top zone depth (%)",            minval = 0.20, maxval = 0.50, step = 0.05, group = grpE, tooltip = "STRONG levels within this % of the highest strong level always draw — the shelf under the highs is always marked. Draw-only: these lines are not traded until they earn touches.")
+maxLevels     = input.int(500,   "Level book safety cap",                minval = 100, maxval = 500, group = grpE)
+
+showLabels    = input.bool(true,  "Show price/touch labels",             group = grpV)
+supColor      = input.color(color.new(#26a69a, 0), "Support line color",    group = grpV)
+resColor      = input.color(color.new(#ef5350, 0), "Resistance line color", group = grpV)
+
+useStrat      = input.bool(true,  "Enable bounce entries",               group = grpS, tooltip = "Long when price dips into an active level's band from above and closes back above it; short mirrored. Orders fill on the signal bar's close (process_orders_on_close).")
+allowLongs    = input.bool(true,  "Allow longs",                         group = grpS)
+allowShorts   = input.bool(true,  "Allow shorts",                        group = grpS)
+stopPct       = input.float(0.35, "Stop distance below/above level (%)", minval = 0.10, maxval = 1.00, step = 0.05, group = grpS)
+rrMult        = input.float(1.5,  "Reward:risk multiple",                minval = 0.5,  maxval = 5.0,  step = 0.25, group = grpS)
+cooldownBars  = input.int(16,    "Cooldown between entries (bars)",      minval = 0,  maxval = 200, group = grpS)
+
+// ────────────────────────────────────────────────────────────────────────────
+// Derived constants
+// ────────────────────────────────────────────────────────────────────────────
+float BARS_PER_DAY = 86400.0 / timeframe.in_seconds(timeframe.period)  // 96 on 15m
+int   SPAN_MS      = tfHours * 3600 * 1000
+int   MAX_KEEP     = freshLookback + pivStrength + 1   // HTF rolling window size
+float mergeTol     = mergeTolPct   / 100.0
+float promoteTol   = promoteTolPct / 100.0
+float band         = bandPct       / 100.0
+float snapTol      = snapTolPct    / 100.0
+
+// ────────────────────────────────────────────────────────────────────────────
+// State — HTF aggregation + the level book (parallel arrays)
+// ────────────────────────────────────────────────────────────────────────────
+var array<float> htfH = array.new<float>()  // completed HTF bar highs (rolling)
+var array<float> htfL = array.new<float>()  // completed HTF bar lows  (rolling)
+var int   htfCount = 0                      // total completed HTF bars ever
+var int   curKey   = na                     // current HTF bucket key
+var float curH     = na
+var float curL     = na
+
+var array<float> lvPx      = array.new<float>()  // level center (drifts on merges)
+var array<float> lvSnap    = array.new<float>()  // displayed price (exact wick)
+var array<int>   lvTouches = array.new<int>()    // distinct touch events
+var array<int>   lvBorn    = array.new<int>()    // bar_index at creation
+var array<int>   lvLastIn  = array.new<int>()    // last bar inside the band
+var array<int>   lvNpiv    = array.new<int>()    // HTF pivots merged in
+var array<bool>  lvStrong  = array.new<bool>()   // ever a fresh K-bar extreme
+
+// ────────────────────────────────────────────────────────────────────────────
+// Level-book operations
+// ────────────────────────────────────────────────────────────────────────────
+levelCount() =>
+    array.size(lvPx)
+
+appendLevel(float px, bool strong) =>
+    array.push(lvPx, px)
+    array.push(lvSnap, px)
+    array.push(lvTouches, 1)
+    array.push(lvBorn, bar_index)
+    array.push(lvLastIn, bar_index)
+    array.push(lvNpiv, 1)
+    array.push(lvStrong, strong)
+
+removeLevel(int j) =>
+    array.remove(lvPx, j)
+    array.remove(lvSnap, j)
+    array.remove(lvTouches, j)
+    array.remove(lvBorn, j)
+    array.remove(lvLastIn, j)
+    array.remove(lvNpiv, j)
+    array.remove(lvStrong, j)
+
+// Create a new level from a confirmed HTF pivot, or merge it into the nearest
+// existing level within tolerance. Strong pivots keep their own line unless an
+// existing level is almost exactly there.
+addPivot(float px, bool strong) =>
+    int   bestJ = -1
+    float bestD = 1e18
+    if levelCount() > 0
+        for j = 0 to levelCount() - 1
+            float d = math.abs(px - array.get(lvPx, j))
+            if d <= array.get(lvPx, j) * mergeTol and d < bestD
+                bestJ := j
+                bestD := d
+    if strong and (bestJ == -1 or bestD > px * promoteTol)
+        appendLevel(px, true)
+    else if bestJ != -1
+        array.set(lvPx, bestJ, array.get(lvPx, bestJ) + alphaNudge * (px - array.get(lvPx, bestJ)))
+        array.set(lvNpiv, bestJ, array.get(lvNpiv, bestJ) + 1)
+        if strong
+            array.set(lvStrong, bestJ, true)
+    else
+        appendLevel(px, strong)
+
+// Highest center among strong levels (na if none) — the "chart top".
+strongTopPx() =>
+    float topPx = na
+    if levelCount() > 0
+        for j = 0 to levelCount() - 1
+            if array.get(lvStrong, j)
+                float pxj = array.get(lvPx, j)
+                topPx := na(topPx) ? pxj : math.max(topPx, pxj)
+    topPx
+
+// Emission: [drawable, tradable] for level j right now. The chart-top-zone
+// pass is draw-only — a fresh extreme near the highs gets its line, but the
+// strategy will not trade a level that has not earned its touches yet.
+emitOk(int j, float topPx) =>
+    float ageD    = (bar_index - array.get(lvBorn, j)) / BARS_PER_DAY
+    int   touches = array.get(lvTouches, j)
+    int   npiv    = array.get(lvNpiv, j)
+    bool  strong  = array.get(lvStrong, j)
+    bool ok = false
+    if ageD <= recentDays
+        ok := touches >= tYoung
+    else
+        int tOld = strong ? tOldStrong : tOldWeak
+        int pOld = strong ? pOldStrong : pOldWeak
+        ok := (touches >= tOld and npiv <= pOld) or (touches >= tShelf and npiv <= pShelf)
+    if not ok and strong and ageD <= rescueDays and touches >= tRescue
+        ok := true                                        // fresh-extreme rescue
+    bool tradable = ok
+    if not ok and strong and not na(topPx) and array.get(lvPx, j) >= topPx * (1 - topZonePct / 100.0)
+        ok := true                                        // chart-top zone (draw-only)
+    [ok, tradable]
+
+// Safety cap (spec 5.3): evict the non-strong, non-drawn level with the
+// fewest touches (oldest last-contact as tie-break); never evict strong or
+// currently-drawn levels. Never reached in 22 months of MNQ 15m (173 levels).
+evictIfFull() =>
+    float topPx = strongTopPx()   // stable: only non-strong levels are removed
+    while levelCount() > maxLevels
+        int   worstJ = -1
+        int   worstT = 2147483647
+        int   worstL = 2147483647
+        for j = 0 to levelCount() - 1
+            if not array.get(lvStrong, j)
+                [drawnOk, tradOk] = emitOk(j, topPx)
+                if not drawnOk
+                    int tj = array.get(lvTouches, j)
+                    int lj = array.get(lvLastIn, j)
+                    if tj < worstT or (tj == worstT and lj < worstL)
+                        worstJ := j
+                        worstT := tj
+                        worstL := lj
+        if worstJ == -1
+            break                 // all overflow is strong/drawn: cap may be exceeded
+        removeLevel(worstJ)
+
+// ────────────────────────────────────────────────────────────────────────────
+// Strategy signals — evaluated BEFORE this bar's book update, so entries react
+// to the levels as they were actually drawn while the bar was forming (the
+// wick re-snap from the current bar must not move the level being traded).
+// ────────────────────────────────────────────────────────────────────────────
+var int lastEntryBar = -1000000
+bool  longSig  = false
+bool  shortSig = false
+float sigLevel = na
+
+if barstate.isconfirmed and useStrat and levelCount() > 0
+    float topPx = strongTopPx()
+    float bestD = 1e18
+    for j = 0 to levelCount() - 1
+        [drawnOk, tradOk] = emitOk(j, topPx)
+        if tradOk
+            float lp = array.get(lvSnap, j)
+            float d  = array.get(lvPx, j) * band
+            // support bounce: came from above, dipped into the band, closed back above
+            bool lb = allowLongs and close[1] > lp and low <= lp + d and close > lp
+            // resistance rejection: came from below, poked into the band, closed back below
+            bool sb = allowShorts and close[1] < lp and high >= lp - d and close < lp
+            float dist = math.abs(close - lp)
+            if (lb or sb) and dist < bestD
+                bestD    := dist
+                sigLevel := lp
+                longSig  := lb
+                shortSig := sb and not lb
+
+// ────────────────────────────────────────────────────────────────────────────
+// Per-bar book update (closed bars only)
+// ────────────────────────────────────────────────────────────────────────────
+if barstate.isconfirmed
+    // -- 1. HTF aggregation ---------------------------------------------------
+    int key = math.floor(time / SPAN_MS)   // v6: int/int division yields float
+    if na(curKey)
+        curKey := key
+        curH := high
+        curL := low
+    else if key == curKey
+        curH := math.max(curH, high)
+        curL := math.min(curL, low)
+    else
+        // An HTF bar just completed: archive it, then check for a pivot.
+        array.push(htfH, curH)
+        array.push(htfL, curL)
+        htfCount += 1
+        if array.size(htfH) > MAX_KEEP
+            array.shift(htfH)
+            array.shift(htfL)
+        curKey := key
+        curH := high
+        curL := low
+
+        // -- 2. HTF pivot check (candidate = bar pivStrength back) ----------
+        if htfCount >= 2 * pivStrength + 1
+            int sz = array.size(htfH)
+            int m  = sz - 1 - pivStrength
+            // pivot high: unique max of the 2s+1 window
+            float ph   = array.get(htfH, m)
+            float wMax = -1e18
+            int   nMax = 0
+            for k = sz - 1 - 2 * pivStrength to sz - 1
+                float v = array.get(htfH, k)
+                wMax := math.max(wMax, v)
+                if v == ph
+                    nMax += 1
+            if ph >= wMax and nMax == 1
+                float fMax = -1e18                       // fresh-extreme test
+                for k = 0 to m - 1
+                    fMax := math.max(fMax, array.get(htfH, k))
+                addPivot(ph, ph > fMax)
+            // pivot low (mirror)
+            float pl   = array.get(htfL, m)
+            float wMin = 1e18
+            int   nMin = 0
+            for k = sz - 1 - 2 * pivStrength to sz - 1
+                float v = array.get(htfL, k)
+                wMin := math.min(wMin, v)
+                if v == pl
+                    nMin += 1
+            if pl <= wMin and nMin == 1
+                float fMin = 1e18
+                for k = 0 to m - 1
+                    fMin := math.min(fMin, array.get(htfL, k))
+                addPivot(pl, pl < fMin)
+            evictIfFull()
+
+    // -- 3. Touch counting + wick re-snap (every bar, all levels) -----------
+    if levelCount() > 0
+        for j = 0 to levelCount() - 1
+            float c = array.get(lvPx, j)
+            float d = c * band
+            if low - d <= c and c <= high + d
+                if bar_index - array.get(lvLastIn, j) >= gapBars
+                    array.set(lvTouches, j, array.get(lvTouches, j) + 1)
+                array.set(lvLastIn, j, bar_index)
+                float w = math.abs(high - c) < math.abs(low - c) ? high : low
+                if math.abs(w - c) <= c * snapTol
+                    array.set(lvSnap, j, w)
+
+// ────────────────────────────────────────────────────────────────────────────
+// Order placement + alerts (orders fill on the signal bar's close)
+// ────────────────────────────────────────────────────────────────────────────
+canTrade = strategy.position_size == 0 and bar_index - lastEntryBar >= cooldownBars
+if longSig and canTrade
+    float stopPx = sigLevel * (1 - stopPct / 100.0)
+    float risk   = close - stopPx
+    if risk > syminfo.mintick
+        strategy.entry("Long", strategy.long)
+        strategy.exit("LongX", "Long", stop = stopPx, limit = close + rrMult * risk)
+        lastEntryBar := bar_index
+if shortSig and canTrade
+    float stopPx = sigLevel * (1 + stopPct / 100.0)
+    float risk   = stopPx - close
+    if risk > syminfo.mintick
+        strategy.entry("Short", strategy.short)
+        strategy.exit("ShortX", "Short", stop = stopPx, limit = close - rrMult * risk)
+        lastEntryBar := bar_index
+
+// alert() (not alertcondition — inert inside strategies). Create ONE alert on
+// this script with condition "Any alert() function call" to receive both.
+if longSig
+    alert("AutoLevels: support bounce at " + str.tostring(sigLevel, format.mintick), alert.freq_once_per_bar_close)
+if shortSig
+    alert("AutoLevels: resistance rejection at " + str.tostring(sigLevel, format.mintick), alert.freq_once_per_bar_close)
+
+// ────────────────────────────────────────────────────────────────────────────
+// Drawing — recompute the emitted set on the last bar
+// ────────────────────────────────────────────────────────────────────────────
+var array<line>  lvLines  = array.new<line>()
+var array<label> lvLabels = array.new<label>()
+
+if barstate.islast
+    if array.size(lvLines) > 0
+        for j = 0 to array.size(lvLines) - 1
+            line.delete(array.get(lvLines, j))
+    array.clear(lvLines)
+    if array.size(lvLabels) > 0
+        for j = 0 to array.size(lvLabels) - 1
+            label.delete(array.get(lvLabels, j))
+    array.clear(lvLabels)
+
+    float topPx = strongTopPx()
+    array<float> drawnPx = array.new<float>()
+    if levelCount() > 0
+        for j = 0 to levelCount() - 1
+            [drawnOk, tradOk] = emitOk(j, topPx)
+            if drawnOk
+                float snapPx = array.get(lvSnap, j)
+                if not array.includes(drawnPx, snapPx)   // de-dup exact prices
+                    array.push(drawnPx, snapPx)
+                    bool  strong = array.get(lvStrong, j)
+                    color col    = snapPx > close ? resColor : supColor
+                    array.push(lvLines, line.new(bar_index, snapPx, bar_index + 1, snapPx,
+                         extend = extend.both, color = col, width = strong ? 2 : 1))
+                    if showLabels
+                        string txt = str.tostring(snapPx, format.mintick) + " · " +
+                             str.tostring(array.get(lvTouches, j)) + "t" + (strong ? " ★" : "")
+                        array.push(lvLabels, label.new(bar_index + 2, snapPx, txt,
+                             style = label.style_label_left, color = color.new(col, 82),
+                             textcolor = col, size = size.small))

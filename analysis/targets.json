@@ -1,0 +1,10 @@
+{
+  "description": "The 17 hand-drawn blue horizontal levels from the trader's MNQ1! chart (2026-07-16 screenshots). These are the ground truth the detector was scored against.",
+  "instrument": "CME_MINI:MNQ1!",
+  "targets": [30886.75, 30539.50, 30297.25, 30007.00, 29753.75, 29406.00, 28798.00,
+              27661.00, 27501.75, 26638.75, 25891.75, 25123.50, 25052.50, 24953.00,
+              24417.50, 22961.50, 22731.75],
+  "neutral_non_blue_boxes": [26379.50, 25390.25, 25274.25, 25223.00, 25206.00, 25163.75,
+                             24035.75, 23940.50, 23886.00, 23757.00],
+  "notes": "neutral_non_blue_boxes are other price-scale boxes visible on the trader's chart that are NOT blue S/R lines (orders/positions/other drawings). The scorer treats detections near them as neither hits nor false positives."
+}
