@@ -42,9 +42,13 @@ Validated vs the trader's 17 levels (MNQ 15m, 2024-09 → 2026-07):
    "Any alert() function call" — bounce/rejection messages include the level
    price.
 
-Load more history (TradingView "deep backtesting" or a paid data window) for
-a fuller level book: the detector needs ~2 weeks of bars before its first
-pivot confirms, and old levels only get better with more history.
+Load more history for a fuller level book: the detector needs ~2 weeks of
+bars before its first pivot confirms, and old levels only get better with
+more history. Expected line counts on MNQ 15m (simulated from the CSVs):
+~13 lines with 5,000 bars loaded, ~15 with 10k, ~26 with 20k, 38 with the
+full 22 months. The bottom-right status table shows bars loaded, HTF bars
+built, and levels tracked/drawn — if "Levels drawn" is 0 the status row
+says why (usually: not enough history loaded yet).
 
 ## Repo layout
 

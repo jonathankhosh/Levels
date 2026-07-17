@@ -76,6 +76,7 @@ topZonePct    = input.float(0.30, "Chart-top zone depth (%)",            minval 
 maxLevels     = input.int(500,   "Level book safety cap",                minval = 100, maxval = 500, group = grpE)
 
 showLabels    = input.bool(true,  "Show price/touch labels",             group = grpV)
+showStats     = input.bool(true,  "Show status table",                   group = grpV, tooltip = "Bottom-right diagnostics: bars loaded, HTF bars built, levels tracked/drawn. If 'Levels drawn' is 0, the status row says why.")
 supColor      = input.color(color.new(#26a69a, 0), "Support line color",    group = grpV)
 resColor      = input.color(color.new(#ef5350, 0), "Resistance line color", group = grpV)
 
@@ -378,3 +379,23 @@ if barstate.islast
                         array.push(lvLabels, label.new(bar_index + 2, snapPx, txt,
                              style = label.style_label_left, color = color.new(col, 82),
                              textcolor = col, size = size.small))
+
+    // Status table — first thing to check when the chart looks empty.
+    if showStats
+        var table st = table.new(position.bottom_right, 2, 5,
+             bgcolor = color.new(color.gray, 88), border_width = 1,
+             border_color = color.new(color.gray, 70))
+        table.cell(st, 0, 0, "Bars loaded",    text_halign = text.align_left, text_size = size.small, text_color = chart.fg_color)
+        table.cell(st, 1, 0, str.tostring(bar_index + 1),        text_size = size.small, text_color = chart.fg_color)
+        table.cell(st, 0, 1, "HTF bars built", text_halign = text.align_left, text_size = size.small, text_color = chart.fg_color)
+        table.cell(st, 1, 1, str.tostring(htfCount),             text_size = size.small, text_color = chart.fg_color)
+        table.cell(st, 0, 2, "Levels tracked", text_halign = text.align_left, text_size = size.small, text_color = chart.fg_color)
+        table.cell(st, 1, 2, str.tostring(levelCount()),         text_size = size.small, text_color = chart.fg_color)
+        table.cell(st, 0, 3, "Levels drawn",   text_halign = text.align_left, text_size = size.small, text_color = chart.fg_color)
+        table.cell(st, 1, 3, str.tostring(array.size(drawnPx)),  text_size = size.small, text_color = chart.fg_color)
+        string hint = array.size(drawnPx) > 0 ? "OK" :
+             htfCount < 2 * pivStrength + 1 ? "warming up — needs " + str.tostring(2 * pivStrength + 1) + " HTF bars" :
+             levelCount() == 0 ? "no HTF pivots confirmed yet — load more history" :
+             "no level passed emission yet — load more history (5k+ bars)"
+        table.cell(st, 0, 4, "Status",         text_halign = text.align_left, text_size = size.small, text_color = chart.fg_color)
+        table.cell(st, 1, 4, hint,                               text_size = size.small, text_color = chart.fg_color)
