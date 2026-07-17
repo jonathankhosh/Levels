@@ -60,7 +60,7 @@ promoteTolPct = input.float(0.08, "Strong-pivot separation (%)",         minval 
 alphaNudge    = input.float(0.25, "Center nudge per merged pivot",       minval = 0.10, maxval = 0.50, step = 0.05, group = grpD, tooltip = "How far the level center drifts toward each newly merged pivot (0.25 = 25% of the distance).")
 bandPct       = input.float(0.09, "Touch band half-width (%)",           minval = 0.06, maxval = 0.12, step = 0.01, group = grpD, tooltip = "A bar whose band-extended range contains the level center registers zone contact.")
 snapTolPct    = input.float(0.30, "Wick re-snap radius (%)",             minval = 0.15, maxval = 0.40, step = 0.01, group = grpD, tooltip = "The drawn price follows the latest bar high/low within this % of the center — lines sit on exact candle wicks.")
-gapBars       = input.int(24,    "Bars between distinct touches",        minval = 16, maxval = 32,  group = grpD, tooltip = "Zone contacts separated by at least this many chart bars count as separate touch events (24 x 15m = 6h).")
+gapHours      = input.float(6.0, "Hours between distinct touches",       minval = 1.0, maxval = 12.0, step = 0.5, group = grpD, tooltip = "Zone contacts separated by at least this long count as separate touch events. Converted to chart bars automatically (6h = 24 bars on 15m, 6 bars on 1h), so the touch cadence is the same on any timeframe.")
 
 recentDays    = input.int(35,    "Young-level age cutoff (days)",        minval = 25, maxval = 45,  group = grpE, tooltip = "Levels younger than this use the young touch threshold; older levels face the stricter old-level rules. Days are measured in traded bars (96 x 15m = 1 day).")
 tYoung        = input.int(11,    "Young: min touches",                   minval = 8,  maxval = 14,  group = grpE)
@@ -91,6 +91,7 @@ cooldownBars  = input.int(16,    "Cooldown between entries (bars)",      minval 
 // Derived constants
 // ────────────────────────────────────────────────────────────────────────────
 float BARS_PER_DAY = 86400.0 / timeframe.in_seconds(timeframe.period)  // 96 on 15m
+int   gapBarsEff   = math.max(1, math.round(gapHours * 3600.0 / timeframe.in_seconds(timeframe.period)))
 int   SPAN_MS      = tfHours * 3600 * 1000
 int   MAX_KEEP     = freshLookback + pivStrength + 1   // HTF rolling window size
 float mergeTol     = mergeTolPct   / 100.0
@@ -226,11 +227,19 @@ var int lastEntryBar = -1000000
 bool  longSig  = false
 bool  shortSig = false
 float sigLevel = na
+bool  canTrade = strategy.position_size == 0 and bar_index - lastEntryBar >= cooldownBars
+// cheap pre-filters: a level can't be tradable below this touch count, and a
+// bounce signal only makes sense near price — skip emitOk for the rest
+int minTradeTouch = math.min(math.min(tYoung, tShelf), math.min(tOldStrong, tRescue))
 
-if barstate.isconfirmed and useStrat and levelCount() > 0
+if barstate.isconfirmed and useStrat and canTrade and levelCount() > 0
     float topPx = strongTopPx()
     float bestD = 1e18
     for j = 0 to levelCount() - 1
+        if array.get(lvTouches, j) < minTradeTouch
+            continue
+        if math.abs(close - array.get(lvSnap, j)) > close * 0.01
+            continue
         [drawnOk, tradOk] = emitOk(j, topPx)
         if tradOk
             float lp = array.get(lvSnap, j)
@@ -311,7 +320,7 @@ if barstate.isconfirmed
             float c = array.get(lvPx, j)
             float d = c * band
             if low - d <= c and c <= high + d
-                if bar_index - array.get(lvLastIn, j) >= gapBars
+                if bar_index - array.get(lvLastIn, j) >= gapBarsEff
                     array.set(lvTouches, j, array.get(lvTouches, j) + 1)
                 array.set(lvLastIn, j, bar_index)
                 float w = math.abs(high - c) < math.abs(low - c) ? high : low
@@ -321,15 +330,14 @@ if barstate.isconfirmed
 // ────────────────────────────────────────────────────────────────────────────
 // Order placement + alerts (orders fill on the signal bar's close)
 // ────────────────────────────────────────────────────────────────────────────
-canTrade = strategy.position_size == 0 and bar_index - lastEntryBar >= cooldownBars
-if longSig and canTrade
+if longSig
     float stopPx = sigLevel * (1 - stopPct / 100.0)
     float risk   = close - stopPx
     if risk > syminfo.mintick
         strategy.entry("Long", strategy.long)
         strategy.exit("LongX", "Long", stop = stopPx, limit = close + rrMult * risk)
         lastEntryBar := bar_index
-if shortSig and canTrade
+if shortSig
     float stopPx = sigLevel * (1 + stopPct / 100.0)
     float risk   = stopPx - close
     if risk > syminfo.mintick
@@ -393,7 +401,9 @@ if barstate.islast
         table.cell(st, 1, 2, str.tostring(levelCount()),         text_size = size.small, text_color = chart.fg_color)
         table.cell(st, 0, 3, "Levels drawn",   text_halign = text.align_left, text_size = size.small, text_color = chart.fg_color)
         table.cell(st, 1, 3, str.tostring(array.size(drawnPx)),  text_size = size.small, text_color = chart.fg_color)
-        string hint = array.size(drawnPx) > 0 ? "OK" :
+        string hint = timeframe.in_seconds(timeframe.period) > tfHours * 3600 ?
+             "chart TF coarser than the HTF bucket — use 15m (tuned) or 1h" :
+             array.size(drawnPx) > 0 ? "OK" :
              htfCount < 2 * pivStrength + 1 ? "warming up — needs " + str.tostring(2 * pivStrength + 1) + " HTF bars" :
              levelCount() == 0 ? "no HTF pivots confirmed yet — load more history" :
              "no level passed emission yet — load more history (5k+ bars)"

@@ -73,6 +73,12 @@ Data comes from the TrendFollower repo's TradingView CSV exports
 ## Tuning to another symbol/timeframe
 
 The sharp knobs (retune these first, see `analysis/PINE_SPEC.md` §6):
-`pivStrength` (8), `mergeTolPct` (0.20), `gapBars` (24 = 6h on 15m),
+`pivStrength` (8), `mergeTolPct` (0.20), `gapHours` (6 — converted to chart
+bars automatically, so any intraday timeframe gets the same touch cadence),
 `freshLookback` (400 HTF bars), `bandPct` (0.09). The emission thresholds
 plateau — move them only after the sharp knobs are placed.
+
+Timeframes: tuned and validated on 15m. It runs correctly on any intraday
+TF at or below the HTF bucket (1h by default) — on a 1h chart expect ~31
+lines with 22 months loaded. Charts coarser than the HTF bucket (4h, daily)
+degrade pivot detection; the status table warns if you try.
