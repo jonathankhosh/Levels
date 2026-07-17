@@ -109,6 +109,15 @@ var int   curKey   = na                     // current HTF bucket key
 var float curH     = na
 var float curL     = na
 
+// Active set: indices of levels within 2% of price. The touch band is 0.09%
+// and the wick-snap radius 0.30%, so distant levels can never interact with
+// the current bar — scanning only the active set makes the per-bar work
+// O(nearby levels) instead of O(whole book), which is what keeps a 20k-bar
+// load at seconds instead of minutes. Rebuilt when an HTF bar completes
+// (book may have changed) or price drifts 0.5% from the last rebuild.
+var array<int> activeIdx = array.new<int>()
+var float      lastRefPx = na
+
 var array<float> lvPx      = array.new<float>()  // level center (drifts on merges)
 var array<float> lvSnap    = array.new<float>()  // displayed price (exact wick)
 var array<int>   lvTouches = array.new<int>()    // distinct touch events
@@ -232,15 +241,18 @@ bool  canTrade = strategy.position_size == 0 and bar_index - lastEntryBar >= coo
 // bounce signal only makes sense near price — skip emitOk for the rest
 int minTradeTouch = math.min(math.min(tYoung, tShelf), math.min(tOldStrong, tRescue))
 
-if barstate.isconfirmed and useStrat and canTrade and levelCount() > 0
-    float topPx = strongTopPx()
+// note: iterates the previous bar's active set (levels near price as they were
+// drawn during the bar) and passes na as topPx — the chart-top rule is
+// draw-only, so tradability never depends on it.
+if barstate.isconfirmed and useStrat and canTrade and array.size(activeIdx) > 0
     float bestD = 1e18
-    for j = 0 to levelCount() - 1
+    for a = 0 to array.size(activeIdx) - 1
+        int j = array.get(activeIdx, a)
         if array.get(lvTouches, j) < minTradeTouch
             continue
         if math.abs(close - array.get(lvSnap, j)) > close * 0.01
             continue
-        [drawnOk, tradOk] = emitOk(j, topPx)
+        [drawnOk, tradOk] = emitOk(j, float(na))
         if tradOk
             float lp = array.get(lvSnap, j)
             float d  = array.get(lvPx, j) * band
@@ -259,6 +271,7 @@ if barstate.isconfirmed and useStrat and canTrade and levelCount() > 0
 // Per-bar book update (closed bars only)
 // ────────────────────────────────────────────────────────────────────────────
 if barstate.isconfirmed
+    bool htfCompleted = false
     // -- 1. HTF aggregation ---------------------------------------------------
     int key = math.floor(time / SPAN_MS)   // v6: int/int division yields float
     if na(curKey)
@@ -270,6 +283,7 @@ if barstate.isconfirmed
         curL := math.min(curL, low)
     else
         // An HTF bar just completed: archive it, then check for a pivot.
+        htfCompleted := true
         array.push(htfH, curH)
         array.push(htfL, curL)
         htfCount += 1
@@ -314,9 +328,21 @@ if barstate.isconfirmed
                 addPivot(pl, pl < fMin)
             evictIfFull()
 
-    // -- 3. Touch counting + wick re-snap (every bar, all levels) -----------
-    if levelCount() > 0
-        for j = 0 to levelCount() - 1
+    // -- 3. Refresh the active set when the book may have changed or price moved
+    float refBase = nz(lastRefPx, close)
+    if htfCompleted or na(lastRefPx) or math.abs(close - refBase) > refBase * 0.005
+        array.clear(activeIdx)
+        if levelCount() > 0
+            for j = 0 to levelCount() - 1
+                if math.abs(array.get(lvPx, j) - close) <= close * 0.02
+                    array.push(activeIdx, j)
+        lastRefPx := close
+
+    // -- 4. Touch counting + wick re-snap (nearby levels only) --------------
+    int nAct = array.size(activeIdx)
+    if nAct > 0
+        for a = 0 to nAct - 1
+            int j = array.get(activeIdx, a)
             float c = array.get(lvPx, j)
             float d = c * band
             if low - d <= c and c <= high + d
