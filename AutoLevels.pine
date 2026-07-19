@@ -384,7 +384,9 @@ if shortSig
 var array<line>  lvLines  = array.new<line>()
 var array<label> lvLabels = array.new<label>()
 
-if barstate.islast
+// v6: strategies don't run on the unconfirmed realtime bar, so also draw on
+// the last confirmed historical bar — otherwise nothing appears until a bar closes.
+if barstate.islast or barstate.islastconfirmedhistory
     if array.size(lvLines) > 0
         for j = 0 to array.size(lvLines) - 1
             line.delete(array.get(lvLines, j))
