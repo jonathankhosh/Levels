@@ -85,7 +85,8 @@ resColor      = input.color(color.new(#ef5350, 0), "Resistance line color", grou
 
 enableA       = input.bool(true,  "Enable A · breakout-retest longs",    group = grpX)
 enableB       = input.bool(true,  "Enable B · big-body momentum",        group = grpX)
-cooldownBars  = input.int(16,    "Cooldown between entries (bars)",      minval = 0,  maxval = 200, group = grpX, tooltip = "Shared by both components. 16 x 15m = 4h.")
+enableC       = input.bool(false, "Enable C · rejection short + FVG (experimental)", group = grpX, tooltip = "Short a resistance rejection in a downtrend when an unfilled fair-value gap sits below as a magnet. Solo stats: tune PF 1.35, hold-out PF 1.27 — real but weaker than A/B, and it steals some A/B entries (one position at a time). OFF by default; enable to forward-test.")
+cooldownBars  = input.int(16,    "Cooldown between entries (bars)",      minval = 0,  maxval = 200, group = grpX, tooltip = "Shared by all components. 16 x 15m = 4h.")
 
 brkXPct       = input.float(0.07, "Breakout margin (%)",                 minval = 0.04, maxval = 0.15, step = 0.01, group = grpA, tooltip = "A bar must CLOSE this % above the nearest tradable resistance to arm the setup.")
 retestW       = input.int(16,    "Retest window (bars)",                 minval = 8,  maxval = 32,  group = grpA, tooltip = "Bars to wait for the retest; the setup expires after this.")
@@ -100,6 +101,13 @@ headroomPct   = input.float(0.50, "Min headroom to opposing level (%)",  minval 
 stopPctB      = input.float(0.35, "B: stop past signal extreme (%)",     minval = 0.25, maxval = 0.50, step = 0.05, group = grpB)
 rrB           = input.float(1.5,  "B: reward:risk",                      minval = 1.2,  maxval = 2.0,  step = 0.1,  group = grpB)
 timeoutB      = input.int(32,    "B: timeout (bars)",                    minval = 24, maxval = 48,  group = grpB, tooltip = "Close a B position at market if neither stop nor target hits within this many bars.")
+
+grpC = "C · Rejection short + FVG (experimental)"
+rejMarginPct  = input.float(0.05, "Rejection margin (%)",                minval = 0.03, maxval = 0.10, step = 0.01, group = grpC, tooltip = "Bar must poke within this % of the resistance and close back below it by the same margin.")
+fvgMaxDistPct = input.float(2.0,  "Max distance to FVG below (%)",       minval = 1.0,  maxval = 3.0,  step = 0.5,  group = grpC, tooltip = "An unfilled gap-up zone must sit below price within this % — the downside magnet. Its top edge becomes the target when at least 0.4R away.")
+freshBarsC    = input.int(32,    "Bars before re-shorting same level",   minval = 16, maxval = 64,  group = grpC)
+stopPadC      = input.float(0.15, "Stop above rejection high (%)",       minval = 0.10, maxval = 0.30, step = 0.05, group = grpC)
+rrC           = input.float(1.5,  "C: fallback reward:risk",             minval = 1.2,  maxval = 2.0,  step = 0.1,  group = grpC)
 
 // ────────────────────────────────────────────────────────────────────────────
 // Derived constants
@@ -131,6 +139,13 @@ var float curL     = na
 // (book may have changed) or price drifts 0.5% from the last rebuild.
 var array<int> activeIdx = array.new<int>()
 var float      lastRefPx = na
+
+// FVG state for component C: open gap-up zones (downside magnets), updated
+// AFTER signals each bar so queries see the book as of the prior close.
+var array<float> fvgBot = array.new<float>()
+var array<float> fvgTop = array.new<float>()
+var array<float> rejPx  = array.new<float>()   // C: last rejection bar per level
+var array<int>   rejBar = array.new<int>()
 
 var array<float> lvPx      = array.new<float>()  // level center (drifts on merges)
 var array<float> lvSnap    = array.new<float>()  // displayed price (exact wick)
@@ -280,6 +295,7 @@ var bool  inPosB       = false    // current position opened by component B
 bool  aLong  = false
 bool  bLong  = false
 bool  bShort = false
+bool  cShort = false
 float sigStop  = na
 float sigLimit = na
 // closedtrades guard: no reentry on the same bar an intrabar exit filled
@@ -364,6 +380,36 @@ if barstate.isconfirmed
                 bShort  := true
                 sigStop := high * (1 + stopPctB / 100.0)
                 sigLimit := close - rrB * (sigStop - close)
+
+    // ---- Component C (experimental, off by default): resistance rejection
+    // in a downtrend with an unfilled FVG below as the magnet/target
+    if enableC and canTrade and not aLong and not bLong and not bShort and not na(res0)
+        float rm = rejMarginPct / 100.0
+        if close[1] < res0 and high >= res0 * (1 - rm) and close < res0 * (1 - rm) and sane and emaF < emaS
+            bool freshOk = true
+            if array.size(rejPx) > 0
+                for k = 0 to array.size(rejPx) - 1
+                    if math.abs(array.get(rejPx, k) - res0) < 0.1 and bar_index - array.get(rejBar, k) < freshBarsC
+                        freshOk := false
+            if freshOk
+                array.push(rejPx, res0)
+                array.push(rejBar, bar_index)
+                if array.size(rejPx) > 50
+                    array.shift(rejPx)
+                    array.shift(rejBar)
+                float gt = na                              // nearest gap top below
+                if array.size(fvgTop) > 0
+                    for k = 0 to array.size(fvgTop) - 1
+                        float t_ = array.get(fvgTop, k)
+                        if t_ < anchor and (na(gt) or t_ > gt)
+                            gt := t_
+                if not na(gt) and (close - gt) / close <= fvgMaxDistPct / 100.0
+                    cShort  := true
+                    sigStop := high * (1 + stopPadC / 100.0)
+                    float riskC = sigStop - close
+                    sigLimit := close - rrC * riskC
+                    if close - gt >= 0.4 * riskC
+                        sigLimit := gt                     // target the gap fill
 
 // ────────────────────────────────────────────────────────────────────────────
 // Per-bar book update (closed bars only)
@@ -451,6 +497,19 @@ if barstate.isconfirmed
                 if math.abs(w - c) <= c * snapTol
                     array.set(lvSnap, j, w)
 
+    // -- 5. FVG bookkeeping (component C): fills first, then new gap-up zones
+    if array.size(fvgBot) > 0
+        for k = array.size(fvgBot) - 1 to 0
+            if low <= array.get(fvgBot, k)
+                array.remove(fvgBot, k)
+                array.remove(fvgTop, k)
+    if bar_index >= 2 and low > high[2]
+        array.push(fvgBot, high[2])
+        array.push(fvgTop, low)
+        if array.size(fvgBot) > 200
+            array.shift(fvgBot)
+            array.shift(fvgTop)
+
 // ────────────────────────────────────────────────────────────────────────────
 // Order placement + alerts (orders fill on the signal bar's close; ONE
 // consolidated stop+limit exit per entry)
@@ -475,6 +534,11 @@ if bShort
     lastEntryBar := bar_index
     entryBarIdx  := bar_index
     inPosB := true
+if cShort
+    strategy.entry("C-S", strategy.short)
+    strategy.exit("C-Sx", "C-S", stop = sigStop, limit = sigLimit)
+    lastEntryBar := bar_index
+    entryBarIdx  := bar_index
 
 // B timeout: flat-close a stale momentum position at the bar close
 if barstate.isconfirmed and inPosB and strategy.position_size != 0 and bar_index - entryBarIdx >= timeoutB
@@ -488,6 +552,8 @@ if bLong
     alert("AutoLevels B: big-body momentum long", alert.freq_once_per_bar_close)
 if bShort
     alert("AutoLevels B: big-body momentum short", alert.freq_once_per_bar_close)
+if cShort
+    alert("AutoLevels C: rejection short, FVG target", alert.freq_once_per_bar_close)
 
 // ────────────────────────────────────────────────────────────────────────────
 // Drawing — recompute the emitted set on the last bar
