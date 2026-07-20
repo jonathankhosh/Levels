@@ -1,34 +1,33 @@
 //@version=6
 // =============================================================================
-// Auto S/R Levels — HTF-pivot level book with touch promotion (MNQ-tuned)
+// Auto S/R Levels — HTF-pivot level book + validated 2-component strategy
 // =============================================================================
-// Auto-detects the horizontal support/resistance levels a discretionary trader
-// would hand-draw: prices where the market printed a significant higher-
-// timeframe swing extreme and then kept reacting, from both sides, for weeks.
+// DETECTION: auto-detects the horizontal S/R levels a discretionary trader
+// would hand-draw. 15m bars are bucketed into 1h bars; a confirmed 1h pivot
+// (strength 8, unique in its window) creates a level at the exact pivot wick
+// or merges into the nearest level within 0.20%. A pivot that is also a fresh
+// 400-hour extreme is "strong". Bars touching a level's ±0.09% band count
+// distinct touches (≥6h apart); the drawn price re-snaps to the latest
+// reaction wick. Levels earn their line via touch-count emission rules and
+// are never retired. Fully causal — closed bars only, no request.security.
 //
-// How it works (fully causal — closed bars only, no request.security):
-//   1. 15m bars are bucketed into HTF (default 1h) bars on the fly.
-//   2. A confirmed HTF pivot (strength 8, unique extreme in its window) either
-//      creates a level at the exact pivot wick or merges into the nearest
-//      level within 0.20% (center nudged toward the pivot). A pivot that is
-//      also a fresh 400-hour extreme is flagged "strong".
-//   3. Every chart bar whose band-extended range (±0.09%) contains a level
-//      center counts zone contact; contacts ≥6h apart are distinct touches,
-//      and the drawn price re-snaps to the latest reaction wick — so lines
-//      sit on exact candle highs/lows, like magnet-snapped hand drawings.
-//   4. Levels are drawn (and traded) only once they pass emission rules that
-//      demand a real retest lifecycle (touch counts by age/strength class).
-//      Levels are never retired: role-flip levels stay relevant for months.
-//
-// Validated on MNQ 15m (2024-09 → 2026-07) against 17 hand-drawn levels:
-// found 14/17 within 30 pts (8/17 within 10 pts), precision 0.61, ~31 lines
-// in the visible range. Tuned on MNQ 15m — retune pivot strength, merge %,
-// and touch gaps before trusting on other symbols/timeframes.
-//
-// The strategy layer is a DEMONSTRATION harness for the levels (bounce-at-
-// level entries with fixed % stop and R-multiple target). It is deliberately
-// simple; treat backtest results as a measure of level quality, not a
-// finished trading system.
+// STRATEGY (validated on cleaned MNQ 15m data, tuned Sep24-Aug25, held-out
+// Mar-Jul26; entries at confirmed closes, one consolidated exit per entry):
+//   A. BREAKOUT-RETEST, long only: a sane bar closes ≥0.07% above the nearest
+//      tradable resistance; within 16 bars price retests the flipped level
+//      (low within 0.12%) while closing above it -> long. Stop 0.35% below
+//      the level; target = next drawable level if ≥0.5R away, else 1.5R.
+//   B. BIG-BODY MOMENTUM, both sides (mined from the user's TrendFollower
+//      work): RTH bar with body ≥1.65xATR(14), body ≥50% of range, volume
+//      >1.5x its SMA20, EMA20/50 aligned with the candle direction. Skipped
+//      if the bar launches off a tradable level (±0.20% veto) or the nearest
+//      opposing level is <0.5% away (headroom). Stop 0.35% past the signal
+//      extreme, 1.5R target, 32-bar timeout.
+//   Validated (1 contract): tune window +$14.3k PF 1.80; hold-out +$3.8k
+//   PF 1.36; every ±20% param perturbation profitable; 2-tick slippage
+//   immune. Realistic forward expectation is the hold-out rate (~$60-70 per
+//   trade, ~15 trades/mo), NOT the tune-window rate. The former demo bounce
+//   layer was removed: it had no edge on clean data.
 // =============================================================================
 
 strategy("Auto S/R Levels (HTF Pivot Book)", "AutoLevels",
@@ -42,7 +41,9 @@ strategy("Auto S/R Levels (HTF Pivot Book)", "AutoLevels",
      commission_value = 0.52,
      slippage = 1,
      pyramiding = 0,
-     process_orders_on_close = true)
+     process_orders_on_close = true,
+     margin_long = 0,
+     margin_short = 0)   // v6 default margin (100%) would reject every MNQ order at $25k capital
 
 // ────────────────────────────────────────────────────────────────────────────
 // Inputs
@@ -50,7 +51,9 @@ strategy("Auto S/R Levels (HTF Pivot Book)", "AutoLevels",
 grpD = "Detection (tuned on MNQ 15m)"
 grpE = "Emission — when a level earns its line"
 grpV = "Display"
-grpS = "Strategy layer (demo)"
+grpX = "Execution"
+grpA = "A · Breakout-retest (long)"
+grpB = "B · Big-Body momentum"
 
 tfHours       = input.int(1,     "HTF aggregation (hours)",              minval = 1,  maxval = 4,   group = grpD, tooltip = "Higher-timeframe bucket size used for pivot detection. All tuning was done at 1h.")
 pivStrength   = input.int(8,     "HTF pivot strength (bars each side)",  minval = 5,  maxval = 12,  group = grpD, tooltip = "A completed HTF bar is a pivot when it is the unique extreme of this many closed HTF bars on each side. SHARP optimum at 8 on MNQ.")
@@ -80,12 +83,23 @@ showStats     = input.bool(true,  "Show status table",                   group =
 supColor      = input.color(color.new(#26a69a, 0), "Support line color",    group = grpV)
 resColor      = input.color(color.new(#ef5350, 0), "Resistance line color", group = grpV)
 
-useStrat      = input.bool(true,  "Enable bounce entries",               group = grpS, tooltip = "Long when price dips into an active level's band from above and closes back above it; short mirrored. Orders fill on the signal bar's close (process_orders_on_close).")
-allowLongs    = input.bool(true,  "Allow longs",                         group = grpS)
-allowShorts   = input.bool(true,  "Allow shorts",                        group = grpS)
-stopPct       = input.float(0.35, "Stop distance below/above level (%)", minval = 0.10, maxval = 1.00, step = 0.05, group = grpS)
-rrMult        = input.float(1.5,  "Reward:risk multiple",                minval = 0.5,  maxval = 5.0,  step = 0.25, group = grpS)
-cooldownBars  = input.int(16,    "Cooldown between entries (bars)",      minval = 0,  maxval = 200, group = grpS)
+enableA       = input.bool(true,  "Enable A · breakout-retest longs",    group = grpX)
+enableB       = input.bool(true,  "Enable B · big-body momentum",        group = grpX)
+cooldownBars  = input.int(16,    "Cooldown between entries (bars)",      minval = 0,  maxval = 200, group = grpX, tooltip = "Shared by both components. 16 x 15m = 4h.")
+
+brkXPct       = input.float(0.07, "Breakout margin (%)",                 minval = 0.04, maxval = 0.15, step = 0.01, group = grpA, tooltip = "A bar must CLOSE this % above the nearest tradable resistance to arm the setup.")
+retestW       = input.int(16,    "Retest window (bars)",                 minval = 8,  maxval = 32,  group = grpA, tooltip = "Bars to wait for the retest; the setup expires after this.")
+retestBandPct = input.float(0.12, "Retest tolerance (%)",                minval = 0.08, maxval = 0.20, step = 0.01, group = grpA, tooltip = "Enter when the bar's low comes back within this % of the flipped level while the close holds above it.")
+stopPctA      = input.float(0.35, "A: stop below level (%)",             minval = 0.20, maxval = 0.50, step = 0.05, group = grpA)
+rrA           = input.float(1.5,  "A: fallback reward:risk",             minval = 1.0,  maxval = 2.5,  step = 0.25, group = grpA, tooltip = "Used when no drawable level sits at least 0.5R above; otherwise the next level is the target.")
+
+bodyAtrMult   = input.float(1.65, "Min body / ATR(14)",                  minval = 1.2,  maxval = 2.2,  step = 0.05, group = grpB)
+volMult       = input.float(1.5,  "Min volume / SMA20(volume)",          minval = 1.2,  maxval = 2.0,  step = 0.1,  group = grpB)
+vetoTolPct    = input.float(0.20, "Level launch-veto distance (%)",      minval = 0.10, maxval = 0.30, step = 0.05, group = grpB, tooltip = "Skip the signal if the bar's extreme sits within this % of any of the 3 nearest same-side tradable levels — momentum launching off a level tends to reverse.")
+headroomPct   = input.float(0.50, "Min headroom to opposing level (%)",  minval = 0.30, maxval = 0.80, step = 0.05, group = grpB, tooltip = "Skip the signal if the nearest opposing tradable level is closer than this — no room to run.")
+stopPctB      = input.float(0.35, "B: stop past signal extreme (%)",     minval = 0.25, maxval = 0.50, step = 0.05, group = grpB)
+rrB           = input.float(1.5,  "B: reward:risk",                      minval = 1.2,  maxval = 2.0,  step = 0.1,  group = grpB)
+timeoutB      = input.int(32,    "B: timeout (bars)",                    minval = 24, maxval = 48,  group = grpB, tooltip = "Close a B position at market if neither stop nor target hits within this many bars.")
 
 // ────────────────────────────────────────────────────────────────────────────
 // Derived constants
@@ -204,6 +218,21 @@ emitOk(int j, float topPx) =>
         ok := true                                        // chart-top zone (draw-only)
     [ok, tradable]
 
+// Nearest DRAWABLE level strictly above the anchor (full-book scan; called
+// only on entry bars, so the O(book) cost is negligible). Used as the
+// component-A profit target.
+nearestDrawableAbove(float anchor) =>
+    float topPx = strongTopPx()
+    float best = na
+    if levelCount() > 0
+        for j = 0 to levelCount() - 1
+            [drawnOk, tradOk] = emitOk(j, topPx)
+            if drawnOk
+                float sp = array.get(lvSnap, j)
+                if sp > anchor and (na(best) or sp < best)
+                    best := sp
+    best
+
 // Safety cap (spec 5.3): evict the non-strong, non-drawn level with the
 // fewest touches (oldest last-contact as tie-break); never evict strong or
 // currently-drawn levels. Never reached in 22 months of MNQ 15m (173 levels).
@@ -228,44 +257,113 @@ evictIfFull() =>
         removeLevel(worstJ)
 
 // ────────────────────────────────────────────────────────────────────────────
-// Strategy signals — evaluated BEFORE this bar's book update, so entries react
-// to the levels as they were actually drawn while the bar was forming (the
-// wick re-snap from the current bar must not move the level being traded).
+// Strategy indicators (must be computed on every bar for series consistency)
 // ────────────────────────────────────────────────────────────────────────────
-var int lastEntryBar = -1000000
-bool  longSig  = false
-bool  shortSig = false
-float sigLevel = na
-bool  canTrade = strategy.position_size == 0 and bar_index - lastEntryBar >= cooldownBars
-// cheap pre-filters: a level can't be tradable below this touch count, and a
-// bounce signal only makes sense near price — skip emitOk for the rest
-int minTradeTouch = math.min(math.min(tYoung, tShelf), math.min(tOldStrong, tRescue))
+float atrB  = ta.atr(14)
+float vSma  = ta.sma(volume, 20)
+float emaF  = ta.ema(close, 20)
+float emaS  = ta.ema(close, 50)
+bool  inRTH = not na(time(timeframe.period, "0930-1600", "America/New_York"))
 
-// note: iterates the previous bar's active set (levels near price as they were
-// drawn during the bar) and passes na as topPx — the chart-top rule is
-// draw-only, so tradability never depends on it.
-if barstate.isconfirmed and useStrat and canTrade and array.size(activeIdx) > 0
-    float bestD = 1e18
-    for a = 0 to array.size(activeIdx) - 1
-        int j = array.get(activeIdx, a)
-        if array.get(lvTouches, j) < minTradeTouch
-            continue
-        if math.abs(close - array.get(lvSnap, j)) > close * 0.01
-            continue
-        [drawnOk, tradOk] = emitOk(j, float(na))
-        if tradOk
-            float lp = array.get(lvSnap, j)
-            float d  = array.get(lvPx, j) * band
-            // support bounce: came from above, dipped into the band, closed back above
-            bool lb = allowLongs and close[1] > lp and low <= lp + d and close > lp
-            // resistance rejection: came from below, poked into the band, closed back below
-            bool sb = allowShorts and close[1] < lp and high >= lp - d and close < lp
-            float dist = math.abs(close - lp)
-            if (lb or sb) and dist < bestD
-                bestD    := dist
-                sigLevel := lp
-                longSig  := lb
-                shortSig := sb and not lb
+// ────────────────────────────────────────────────────────────────────────────
+// Strategy signals — evaluated BEFORE this bar's book update, so entries react
+// to the levels as they were actually drawn while the bar was forming.
+// Component A: breakout-retest longs (role flip). Component B: RTH big-body
+// momentum with level anti-confluence. A wins same-bar conflicts.
+// ────────────────────────────────────────────────────────────────────────────
+var int   lastEntryBar = -1000000
+var float pendLevel    = na       // armed breakout level awaiting retest
+var int   pendBar      = na
+var int   entryBarIdx  = na
+var bool  inPosB       = false    // current position opened by component B
+
+bool  aLong  = false
+bool  bLong  = false
+bool  bShort = false
+float sigStop  = na
+float sigLimit = na
+// closedtrades guard: no reentry on the same bar an intrabar exit filled
+// (the validated engine never does this)
+bool  canTrade = strategy.position_size == 0 and bar_index - lastEntryBar >= cooldownBars and
+     strategy.closedtrades == nz(strategy.closedtrades[1])
+int   minTradeTouch = math.min(math.min(tYoung, tShelf), math.min(tOldStrong, tRescue))
+
+if barstate.isconfirmed
+    // nearest tradable levels around the prior close, from the active set
+    float anchor = close[1]
+    array<float> supArr = array.new<float>()
+    array<float> resArr = array.new<float>()
+    // wide bars (or price near the active-set window edge) can probe beyond the
+    // 2% cached set — fall back to a full-book scan there (rare, so still cheap)
+    bool needFull = high - low > close * 0.005 or math.abs(close - nz(lastRefPx, close)) > close * 0.008
+    int scanN = needFull ? levelCount() : array.size(activeIdx)
+    if scanN > 0
+        for a = 0 to scanN - 1
+            int j = needFull ? a : array.get(activeIdx, a)
+            if array.get(lvTouches, j) >= minTradeTouch
+                [drawnOk, tradOk] = emitOk(j, float(na))
+                if tradOk
+                    float sp = array.get(lvSnap, j)
+                    if sp <= anchor
+                        array.push(supArr, sp)
+                    else
+                        array.push(resArr, sp)
+    array.sort(supArr, order.descending)   // sup0 = nearest below
+    array.sort(resArr, order.ascending)    // res0 = nearest above
+    float sup0 = array.size(supArr) > 0 ? array.get(supArr, 0) : na
+    float res0 = array.size(resArr) > 0 ? array.get(resArr, 0) : na
+    bool  sane = math.abs(close / close[1] - 1) <= 0.01   // freak-bar guard
+
+    // ---- Component A: retest check first (a breakout bar can't be its own retest)
+    if enableA and not na(pendLevel)
+        if close < pendLevel
+            pendLevel := na                               // failed break
+        else if bar_index - pendBar > retestW
+            pendLevel := na                               // expired
+        else if low <= pendLevel * (1 + retestBandPct / 100.0)
+            if not sane
+                pendLevel := na
+            else
+                if canTrade
+                    aLong   := true
+                    sigStop := pendLevel * (1 - stopPctA / 100.0)
+                    float risk = close - sigStop
+                    sigLimit := close + rrA * risk
+                    float dres = nearestDrawableAbove(anchor)
+                    if not na(dres) and dres - close >= 0.5 * risk
+                        sigLimit := dres                  // level target beats R-multiple
+                pendLevel := na
+    // breakout detection (arm/re-arm the setup)
+    if enableA and sane and not na(res0) and close >= res0 * (1 + brkXPct / 100.0)
+        pendLevel := res0
+        pendBar   := bar_index
+
+    // ---- Component B: big-body momentum with level anti-confluence
+    if enableB and canTrade and not aLong and inRTH
+        float body = math.abs(close - open)
+        float rng  = high - low
+        if rng > 0 and body >= bodyAtrMult * atrB and body / rng >= 0.5 and volume > volMult * vSma
+            float vt = vetoTolPct / 100.0
+            bool vetoL = false
+            bool vetoS = false
+            if array.size(supArr) > 0
+                for k = 0 to math.min(2, array.size(supArr) - 1)
+                    if math.abs(low - array.get(supArr, k)) <= vt * array.get(supArr, k)
+                        vetoL := true
+            if array.size(resArr) > 0
+                for k = 0 to math.min(2, array.size(resArr) - 1)
+                    if math.abs(array.get(resArr, k) - high) <= vt * array.get(resArr, k)
+                        vetoS := true
+            bool roomL = na(res0) or res0 - close > headroomPct / 100.0 * close
+            bool roomS = na(sup0) or close - sup0 > headroomPct / 100.0 * close
+            if close > open and emaF > emaS and not vetoL and roomL
+                bLong   := true
+                sigStop := low * (1 - stopPctB / 100.0)
+                sigLimit := close + rrB * (close - sigStop)
+            else if close < open and emaF < emaS and not vetoS and roomS
+                bShort  := true
+                sigStop := high * (1 + stopPctB / 100.0)
+                sigLimit := close - rrB * (sigStop - close)
 
 // ────────────────────────────────────────────────────────────────────────────
 // Per-bar book update (closed bars only)
@@ -354,29 +452,42 @@ if barstate.isconfirmed
                     array.set(lvSnap, j, w)
 
 // ────────────────────────────────────────────────────────────────────────────
-// Order placement + alerts (orders fill on the signal bar's close)
+// Order placement + alerts (orders fill on the signal bar's close; ONE
+// consolidated stop+limit exit per entry)
 // ────────────────────────────────────────────────────────────────────────────
-if longSig
-    float stopPx = sigLevel * (1 - stopPct / 100.0)
-    float risk   = close - stopPx
-    if risk > syminfo.mintick
-        strategy.entry("Long", strategy.long)
-        strategy.exit("LongX", "Long", stop = stopPx, limit = close + rrMult * risk)
-        lastEntryBar := bar_index
-if shortSig
-    float stopPx = sigLevel * (1 + stopPct / 100.0)
-    float risk   = stopPx - close
-    if risk > syminfo.mintick
-        strategy.entry("Short", strategy.short)
-        strategy.exit("ShortX", "Short", stop = stopPx, limit = close - rrMult * risk)
-        lastEntryBar := bar_index
+if strategy.position_size == 0
+    inPosB := false
+
+if aLong
+    strategy.entry("A-L", strategy.long)
+    strategy.exit("A-Lx", "A-L", stop = sigStop, limit = sigLimit)
+    lastEntryBar := bar_index
+    entryBarIdx  := bar_index
+if bLong
+    strategy.entry("B-L", strategy.long)
+    strategy.exit("B-Lx", "B-L", stop = sigStop, limit = sigLimit)
+    lastEntryBar := bar_index
+    entryBarIdx  := bar_index
+    inPosB := true
+if bShort
+    strategy.entry("B-S", strategy.short)
+    strategy.exit("B-Sx", "B-S", stop = sigStop, limit = sigLimit)
+    lastEntryBar := bar_index
+    entryBarIdx  := bar_index
+    inPosB := true
+
+// B timeout: flat-close a stale momentum position at the bar close
+if barstate.isconfirmed and inPosB and strategy.position_size != 0 and bar_index - entryBarIdx >= timeoutB
+    strategy.close_all(comment = "B timeout")
 
 // alert() (not alertcondition — inert inside strategies). Create ONE alert on
-// this script with condition "Any alert() function call" to receive both.
-if longSig
-    alert("AutoLevels: support bounce at " + str.tostring(sigLevel, format.mintick), alert.freq_once_per_bar_close)
-if shortSig
-    alert("AutoLevels: resistance rejection at " + str.tostring(sigLevel, format.mintick), alert.freq_once_per_bar_close)
+// this script with condition "Any alert() function call" to receive all.
+if aLong
+    alert("AutoLevels A: breakout-retest long, level " + str.tostring(pendLevel[1], format.mintick), alert.freq_once_per_bar_close)
+if bLong
+    alert("AutoLevels B: big-body momentum long", alert.freq_once_per_bar_close)
+if bShort
+    alert("AutoLevels B: big-body momentum short", alert.freq_once_per_bar_close)
 
 // ────────────────────────────────────────────────────────────────────────────
 // Drawing — recompute the emitted set on the last bar
