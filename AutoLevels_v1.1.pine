@@ -1,0 +1,616 @@
+//@version=6
+// =============================================================================
+// Auto S/R Levels — HTF-pivot level book + validated 2-component strategy
+// =============================================================================
+// DETECTION: auto-detects the horizontal S/R levels a discretionary trader
+// would hand-draw. 15m bars are bucketed into 1h bars; a confirmed 1h pivot
+// (strength 8, unique in its window) creates a level at the exact pivot wick
+// or merges into the nearest level within 0.20%. A pivot that is also a fresh
+// 400-hour extreme is "strong". Bars touching a level's ±0.09% band count
+// distinct touches (≥6h apart); the drawn price re-snaps to the latest
+// reaction wick. Levels earn their line via touch-count emission rules and
+// are never retired. Fully causal — closed bars only, no request.security.
+//
+// STRATEGY (validated on cleaned MNQ 15m data, tuned Sep24-Aug25, held-out
+// Mar-Jul26; entries at confirmed closes, one consolidated exit per entry):
+//   A. BREAKOUT-RETEST, long only: a sane bar closes ≥0.07% above the nearest
+//      tradable resistance; within 16 bars price retests the flipped level
+//      (low within 0.12%) while closing above it -> long. Stop 0.35% below
+//      the level; target = next drawable level if ≥0.5R away, else 1.5R.
+//   B. BIG-BODY MOMENTUM, both sides (mined from the user's TrendFollower
+//      work): RTH bar with body ≥1.65xATR(14), body ≥50% of range, volume
+//      >1.5x its SMA20, EMA20/50 aligned with the candle direction. Skipped
+//      if the bar launches off a tradable level (±0.20% veto) or the nearest
+//      opposing level is <0.5% away (headroom). Stop 0.35% past the signal
+//      extreme, 1.5R target, 32-bar timeout.
+//   Validated (1 contract): tune window +$14.3k PF 1.80; hold-out +$3.8k
+//   PF 1.36; every ±20% param perturbation profitable; 2-tick slippage
+//   immune. Realistic forward expectation is the hold-out rate (~$60-70 per
+//   trade, ~15 trades/mo), NOT the tune-window rate. The former demo bounce
+//   layer was removed: it had no edge on clean data.
+// =============================================================================
+
+strategy("Auto S/R Levels v1.1", "AutoLevels v1.1",
+     overlay = true,
+     max_lines_count = 500,
+     max_labels_count = 500,
+     initial_capital = 25000,
+     default_qty_type = strategy.fixed,
+     default_qty_value = 1,
+     commission_type = strategy.commission.cash_per_contract,
+     commission_value = 0.52,
+     slippage = 1,
+     pyramiding = 0,
+     process_orders_on_close = true,
+     margin_long = 0,
+     margin_short = 0)   // v6 default margin (100%) would reject every MNQ order at $25k capital
+
+// ────────────────────────────────────────────────────────────────────────────
+// Inputs
+// ────────────────────────────────────────────────────────────────────────────
+grpD = "Detection (tuned on MNQ 15m)"
+grpE = "Emission — when a level earns its line"
+grpV = "Display"
+grpX = "Execution"
+grpA = "A · Breakout-retest (long)"
+grpB = "B · Big-Body momentum"
+
+tfHours       = input.int(1,     "HTF aggregation (hours)",              minval = 1,  maxval = 4,   group = grpD, tooltip = "Higher-timeframe bucket size used for pivot detection. All tuning was done at 1h.")
+pivStrength   = input.int(8,     "HTF pivot strength (bars each side)",  minval = 5,  maxval = 12,  group = grpD, tooltip = "A completed HTF bar is a pivot when it is the unique extreme of this many closed HTF bars on each side. SHARP optimum at 8 on MNQ.")
+freshLookback = input.int(400,   "Fresh-extreme lookback (HTF bars)",    minval = 200, maxval = 600, group = grpD, tooltip = "A pivot that exceeds every HTF extreme in this many prior bars is flagged STRONG (fresh multi-week extreme).")
+mergeTolPct   = input.float(0.20, "Merge tolerance (%)",                 minval = 0.10, maxval = 0.30, step = 0.01, group = grpD, tooltip = "A new pivot within this % of an existing level's center merges into it instead of creating a new level.")
+promoteTolPct = input.float(0.08, "Strong-pivot separation (%)",         minval = 0.05, maxval = 0.15, step = 0.01, group = grpD, tooltip = "A STRONG pivot farther than this % from every level always starts its own level, even inside merge tolerance.")
+alphaNudge    = input.float(0.25, "Center nudge per merged pivot",       minval = 0.10, maxval = 0.50, step = 0.05, group = grpD, tooltip = "How far the level center drifts toward each newly merged pivot (0.25 = 25% of the distance).")
+bandPct       = input.float(0.09, "Touch band half-width (%)",           minval = 0.06, maxval = 0.12, step = 0.01, group = grpD, tooltip = "A bar whose band-extended range contains the level center registers zone contact.")
+snapTolPct    = input.float(0.30, "Wick re-snap radius (%)",             minval = 0.15, maxval = 0.40, step = 0.01, group = grpD, tooltip = "The drawn price follows the latest bar high/low within this % of the center — lines sit on exact candle wicks.")
+gapHours      = input.float(6.0, "Hours between distinct touches",       minval = 1.0, maxval = 12.0, step = 0.5, group = grpD, tooltip = "Zone contacts separated by at least this long count as separate touch events. Converted to chart bars automatically (6h = 24 bars on 15m, 6 bars on 1h), so the touch cadence is the same on any timeframe.")
+
+recentDays    = input.int(35,    "Young-level age cutoff (days)",        minval = 25, maxval = 45,  group = grpE, tooltip = "Levels younger than this use the young touch threshold; older levels face the stricter old-level rules. Days are measured in traded bars (96 x 15m = 1 day).")
+tYoung        = input.int(11,    "Young: min touches",                   minval = 8,  maxval = 14,  group = grpE)
+tOldStrong    = input.int(24,    "Old strong: min touches",              minval = 18, maxval = 32,  group = grpE)
+pOldStrong    = input.int(9,     "Old strong: max merged pivots",        minval = 6,  maxval = 12,  group = grpE, tooltip = "Levels that absorbed too many pivots are blurry chop zones, not crisp lines.")
+tOldWeak      = input.int(40,    "Old non-strong: min touches",          minval = 36, maxval = 48,  group = grpE)
+pOldWeak      = input.int(7,     "Old non-strong: max merged pivots",    minval = 5,  maxval = 9,   group = grpE)
+tShelf        = input.int(14,    "Crisp shelf: min touches",             minval = 12, maxval = 18,  group = grpE, tooltip = "Old level alternative: one clean price respected repeatedly (very few merged pivots).")
+pShelf        = input.int(2,     "Crisp shelf: max merged pivots",       minval = 1,  maxval = 3,   group = grpE)
+tRescue       = input.int(10,    "Fresh-extreme rescue: min touches",    minval = 6,  maxval = 12,  group = grpE, tooltip = "A STRONG (fresh-extreme) level this young is drawn once it has these touches, even if other rules fail.")
+rescueDays    = input.int(45,    "Fresh-extreme rescue: max age (days)", minval = 35, maxval = 55,  group = grpE)
+topZonePct    = input.float(0.30, "Chart-top zone depth (%)",            minval = 0.20, maxval = 0.50, step = 0.05, group = grpE, tooltip = "STRONG levels within this % of the highest strong level always draw — the shelf under the highs is always marked. Draw-only: these lines are not traded until they earn touches.")
+maxLevels     = input.int(500,   "Level book safety cap",                minval = 100, maxval = 500, group = grpE)
+
+showLabels    = input.bool(true,  "Show price/touch labels",             group = grpV)
+showStats     = input.bool(true,  "Show status table",                   group = grpV, tooltip = "Bottom-right diagnostics: bars loaded, HTF bars built, levels tracked/drawn. If 'Levels drawn' is 0, the status row says why.")
+supColor      = input.color(color.new(#26a69a, 0), "Support line color",    group = grpV)
+resColor      = input.color(color.new(#ef5350, 0), "Resistance line color", group = grpV)
+
+enableA       = input.bool(true,  "Enable A · breakout-retest longs",    group = grpX)
+enableB       = input.bool(true,  "Enable B · big-body momentum",        group = grpX)
+enableC       = input.bool(false, "Enable C · rejection short + FVG (experimental)", group = grpX, tooltip = "Short a resistance rejection in a downtrend when an unfilled fair-value gap sits below as a magnet. Solo stats: tune PF 1.35, hold-out PF 1.27 — real but weaker than A/B, and it steals some A/B entries (one position at a time). OFF by default; enable to forward-test.")
+cooldownBars  = input.int(16,    "Cooldown between entries (bars)",      minval = 0,  maxval = 200, group = grpX, tooltip = "Shared by all components. 16 x 15m = 4h.")
+
+brkXPct       = input.float(0.07, "Breakout margin (%)",                 minval = 0.04, maxval = 0.15, step = 0.01, group = grpA, tooltip = "A bar must CLOSE this % above the nearest tradable resistance to arm the setup.")
+retestW       = input.int(16,    "Retest window (bars)",                 minval = 8,  maxval = 32,  group = grpA, tooltip = "Bars to wait for the retest; the setup expires after this.")
+retestBandPct = input.float(0.12, "Retest tolerance (%)",                minval = 0.08, maxval = 0.20, step = 0.01, group = grpA, tooltip = "Enter when the bar's low comes back within this % of the flipped level while the close holds above it.")
+stopPctA      = input.float(0.35, "A: stop below level (%)",             minval = 0.20, maxval = 0.50, step = 0.05, group = grpA)
+rrA           = input.float(1.5,  "A: fallback reward:risk",             minval = 1.0,  maxval = 2.5,  step = 0.25, group = grpA, tooltip = "Used when no drawable level sits at least 0.5R above; otherwise the next level is the target.")
+
+bodyAtrMult   = input.float(1.65, "Min body / ATR(14)",                  minval = 1.2,  maxval = 2.2,  step = 0.05, group = grpB)
+volMult       = input.float(1.5,  "Min volume / SMA20(volume)",          minval = 1.2,  maxval = 2.0,  step = 0.1,  group = grpB)
+vetoTolPct    = input.float(0.20, "Level launch-veto distance (%)",      minval = 0.10, maxval = 0.30, step = 0.05, group = grpB, tooltip = "Skip the signal if the bar's extreme sits within this % of any of the 3 nearest same-side tradable levels — momentum launching off a level tends to reverse.")
+headroomPct   = input.float(0.50, "Min headroom to opposing level (%)",  minval = 0.30, maxval = 0.80, step = 0.05, group = grpB, tooltip = "Skip the signal if the nearest opposing tradable level is closer than this — no room to run.")
+stopPctB      = input.float(0.35, "B: stop past signal extreme (%)",     minval = 0.25, maxval = 0.50, step = 0.05, group = grpB)
+rrB           = input.float(1.5,  "B: reward:risk",                      minval = 1.2,  maxval = 2.0,  step = 0.1,  group = grpB)
+timeoutB      = input.int(32,    "B: timeout (bars)",                    minval = 24, maxval = 48,  group = grpB, tooltip = "Close a B position at market if neither stop nor target hits within this many bars.")
+
+grpC = "C · Rejection short + FVG (experimental)"
+rejMarginPct  = input.float(0.05, "Rejection margin (%)",                minval = 0.03, maxval = 0.10, step = 0.01, group = grpC, tooltip = "Bar must poke within this % of the resistance and close back below it by the same margin.")
+fvgMaxDistPct = input.float(2.0,  "Max distance to FVG below (%)",       minval = 1.0,  maxval = 3.0,  step = 0.5,  group = grpC, tooltip = "An unfilled gap-up zone must sit below price within this % — the downside magnet. Its top edge becomes the target when at least 0.4R away.")
+freshBarsC    = input.int(32,    "Bars before re-shorting same level",   minval = 16, maxval = 64,  group = grpC)
+stopPadC      = input.float(0.15, "Stop above rejection high (%)",       minval = 0.10, maxval = 0.30, step = 0.05, group = grpC)
+rrC           = input.float(1.5,  "C: fallback reward:risk",             minval = 1.2,  maxval = 2.0,  step = 0.1,  group = grpC)
+
+// ────────────────────────────────────────────────────────────────────────────
+// Derived constants
+// ────────────────────────────────────────────────────────────────────────────
+float BARS_PER_DAY = 86400.0 / timeframe.in_seconds(timeframe.period)  // 96 on 15m
+int   gapBarsEff   = math.max(1, math.round(gapHours * 3600.0 / timeframe.in_seconds(timeframe.period)))
+int   SPAN_MS      = tfHours * 3600 * 1000
+int   MAX_KEEP     = freshLookback + pivStrength + 1   // HTF rolling window size
+float mergeTol     = mergeTolPct   / 100.0
+float promoteTol   = promoteTolPct / 100.0
+float band         = bandPct       / 100.0
+float snapTol      = snapTolPct    / 100.0
+
+// ────────────────────────────────────────────────────────────────────────────
+// State — HTF aggregation + the level book (parallel arrays)
+// ────────────────────────────────────────────────────────────────────────────
+var array<float> htfH = array.new<float>()  // completed HTF bar highs (rolling)
+var array<float> htfL = array.new<float>()  // completed HTF bar lows  (rolling)
+var int   htfCount = 0                      // total completed HTF bars ever
+var int   curKey   = na                     // current HTF bucket key
+var float curH     = na
+var float curL     = na
+
+// Active set: indices of levels within 2% of price. The touch band is 0.09%
+// and the wick-snap radius 0.30%, so distant levels can never interact with
+// the current bar — scanning only the active set makes the per-bar work
+// O(nearby levels) instead of O(whole book), which is what keeps a 20k-bar
+// load at seconds instead of minutes. Rebuilt when an HTF bar completes
+// (book may have changed) or price drifts 0.5% from the last rebuild.
+var array<int> activeIdx = array.new<int>()
+var float      lastRefPx = na
+
+// FVG state for component C: open gap-up zones (downside magnets), updated
+// AFTER signals each bar so queries see the book as of the prior close.
+var array<float> fvgBot = array.new<float>()
+var array<float> fvgTop = array.new<float>()
+var array<float> rejPx  = array.new<float>()   // C: last rejection bar per level
+var array<int>   rejBar = array.new<int>()
+
+var array<float> lvPx      = array.new<float>()  // level center (drifts on merges)
+var array<float> lvSnap    = array.new<float>()  // displayed price (exact wick)
+var array<int>   lvTouches = array.new<int>()    // distinct touch events
+var array<int>   lvBorn    = array.new<int>()    // bar_index at creation
+var array<int>   lvLastIn  = array.new<int>()    // last bar inside the band
+var array<int>   lvNpiv    = array.new<int>()    // HTF pivots merged in
+var array<bool>  lvStrong  = array.new<bool>()   // ever a fresh K-bar extreme
+
+// ────────────────────────────────────────────────────────────────────────────
+// Level-book operations
+// ────────────────────────────────────────────────────────────────────────────
+levelCount() =>
+    array.size(lvPx)
+
+appendLevel(float px, bool strong) =>
+    array.push(lvPx, px)
+    array.push(lvSnap, px)
+    array.push(lvTouches, 1)
+    array.push(lvBorn, bar_index)
+    array.push(lvLastIn, bar_index)
+    array.push(lvNpiv, 1)
+    array.push(lvStrong, strong)
+
+removeLevel(int j) =>
+    array.remove(lvPx, j)
+    array.remove(lvSnap, j)
+    array.remove(lvTouches, j)
+    array.remove(lvBorn, j)
+    array.remove(lvLastIn, j)
+    array.remove(lvNpiv, j)
+    array.remove(lvStrong, j)
+
+// Create a new level from a confirmed HTF pivot, or merge it into the nearest
+// existing level within tolerance. Strong pivots keep their own line unless an
+// existing level is almost exactly there.
+addPivot(float px, bool strong) =>
+    int   bestJ = -1
+    float bestD = 1e18
+    if levelCount() > 0
+        for j = 0 to levelCount() - 1
+            float d = math.abs(px - array.get(lvPx, j))
+            if d <= array.get(lvPx, j) * mergeTol and d < bestD
+                bestJ := j
+                bestD := d
+    if strong and (bestJ == -1 or bestD > px * promoteTol)
+        appendLevel(px, true)
+    else if bestJ != -1
+        array.set(lvPx, bestJ, array.get(lvPx, bestJ) + alphaNudge * (px - array.get(lvPx, bestJ)))
+        array.set(lvNpiv, bestJ, array.get(lvNpiv, bestJ) + 1)
+        if strong
+            array.set(lvStrong, bestJ, true)
+    else
+        appendLevel(px, strong)
+
+// Highest center among strong levels (na if none) — the "chart top".
+strongTopPx() =>
+    float topPx = na
+    if levelCount() > 0
+        for j = 0 to levelCount() - 1
+            if array.get(lvStrong, j)
+                float pxj = array.get(lvPx, j)
+                topPx := na(topPx) ? pxj : math.max(topPx, pxj)
+    topPx
+
+// Emission: [drawable, tradable] for level j right now. The chart-top-zone
+// pass is draw-only — a fresh extreme near the highs gets its line, but the
+// strategy will not trade a level that has not earned its touches yet.
+emitOk(int j, float topPx) =>
+    float ageD    = (bar_index - array.get(lvBorn, j)) / BARS_PER_DAY
+    int   touches = array.get(lvTouches, j)
+    int   npiv    = array.get(lvNpiv, j)
+    bool  strong  = array.get(lvStrong, j)
+    bool ok = false
+    if ageD <= recentDays
+        ok := touches >= tYoung
+    else
+        int tOld = strong ? tOldStrong : tOldWeak
+        int pOld = strong ? pOldStrong : pOldWeak
+        ok := (touches >= tOld and npiv <= pOld) or (touches >= tShelf and npiv <= pShelf)
+    if not ok and strong and ageD <= rescueDays and touches >= tRescue
+        ok := true                                        // fresh-extreme rescue
+    bool tradable = ok
+    if not ok and strong and not na(topPx) and array.get(lvPx, j) >= topPx * (1 - topZonePct / 100.0)
+        ok := true                                        // chart-top zone (draw-only)
+    [ok, tradable]
+
+// Nearest DRAWABLE level strictly above the anchor (full-book scan; called
+// only on entry bars, so the O(book) cost is negligible). Used as the
+// component-A profit target.
+nearestDrawableAbove(float anchor) =>
+    float topPx = strongTopPx()
+    float best = na
+    if levelCount() > 0
+        for j = 0 to levelCount() - 1
+            [drawnOk, tradOk] = emitOk(j, topPx)
+            if drawnOk
+                float sp = array.get(lvSnap, j)
+                if sp > anchor and (na(best) or sp < best)
+                    best := sp
+    best
+
+// Safety cap (spec 5.3): evict the non-strong, non-drawn level with the
+// fewest touches (oldest last-contact as tie-break); never evict strong or
+// currently-drawn levels. Never reached in 22 months of MNQ 15m (173 levels).
+evictIfFull() =>
+    float topPx = strongTopPx()   // stable: only non-strong levels are removed
+    while levelCount() > maxLevels
+        int   worstJ = -1
+        int   worstT = 2147483647
+        int   worstL = 2147483647
+        for j = 0 to levelCount() - 1
+            if not array.get(lvStrong, j)
+                [drawnOk, tradOk] = emitOk(j, topPx)
+                if not drawnOk
+                    int tj = array.get(lvTouches, j)
+                    int lj = array.get(lvLastIn, j)
+                    if tj < worstT or (tj == worstT and lj < worstL)
+                        worstJ := j
+                        worstT := tj
+                        worstL := lj
+        if worstJ == -1
+            break                 // all overflow is strong/drawn: cap may be exceeded
+        removeLevel(worstJ)
+
+// ────────────────────────────────────────────────────────────────────────────
+// Strategy indicators (must be computed on every bar for series consistency)
+// ────────────────────────────────────────────────────────────────────────────
+float atrB  = ta.atr(14)
+float vSma  = ta.sma(volume, 20)
+float emaF  = ta.ema(close, 20)
+float emaS  = ta.ema(close, 50)
+bool  inRTH = not na(time(timeframe.period, "0930-1600", "America/New_York"))
+
+// ────────────────────────────────────────────────────────────────────────────
+// Strategy signals — evaluated BEFORE this bar's book update, so entries react
+// to the levels as they were actually drawn while the bar was forming.
+// Component A: breakout-retest longs (role flip). Component B: RTH big-body
+// momentum with level anti-confluence. A wins same-bar conflicts.
+// ────────────────────────────────────────────────────────────────────────────
+var int   lastEntryBar = -1000000
+var float pendLevel    = na       // armed breakout level awaiting retest
+var int   pendBar      = na
+var int   entryBarIdx  = na
+var bool  inPosB       = false    // current position opened by component B
+
+bool  aLong  = false
+bool  bLong  = false
+bool  bShort = false
+bool  cShort = false
+float sigStop  = na
+float sigLimit = na
+// closedtrades guard: no reentry on the same bar an intrabar exit filled
+// (the validated engine never does this)
+bool  canTrade = strategy.position_size == 0 and bar_index - lastEntryBar >= cooldownBars and
+     strategy.closedtrades == nz(strategy.closedtrades[1])
+int   minTradeTouch = math.min(math.min(tYoung, tShelf), math.min(tOldStrong, tRescue))
+
+if barstate.isconfirmed
+    // nearest tradable levels around the prior close, from the active set
+    float anchor = close[1]
+    array<float> supArr = array.new<float>()
+    array<float> resArr = array.new<float>()
+    // wide bars (or price near the active-set window edge) can probe beyond the
+    // 2% cached set — fall back to a full-book scan there (rare, so still cheap)
+    bool needFull = high - low > close * 0.005 or math.abs(close - nz(lastRefPx, close)) > close * 0.008
+    int scanN = needFull ? levelCount() : array.size(activeIdx)
+    if scanN > 0
+        for a = 0 to scanN - 1
+            int j = needFull ? a : array.get(activeIdx, a)
+            if array.get(lvTouches, j) >= minTradeTouch
+                [drawnOk, tradOk] = emitOk(j, float(na))
+                if tradOk
+                    float sp = array.get(lvSnap, j)
+                    if sp <= anchor
+                        array.push(supArr, sp)
+                    else
+                        array.push(resArr, sp)
+    array.sort(supArr, order.descending)   // sup0 = nearest below
+    array.sort(resArr, order.ascending)    // res0 = nearest above
+    float sup0 = array.size(supArr) > 0 ? array.get(supArr, 0) : na
+    float res0 = array.size(resArr) > 0 ? array.get(resArr, 0) : na
+    bool  sane = math.abs(close / close[1] - 1) <= 0.01   // freak-bar guard
+
+    // ---- Component A: retest check first (a breakout bar can't be its own retest)
+    if enableA and not na(pendLevel)
+        if close < pendLevel
+            pendLevel := na                               // failed break
+        else if bar_index - pendBar > retestW
+            pendLevel := na                               // expired
+        else if low <= pendLevel * (1 + retestBandPct / 100.0)
+            if not sane
+                pendLevel := na
+            else
+                if canTrade
+                    aLong   := true
+                    sigStop := pendLevel * (1 - stopPctA / 100.0)
+                    float risk = close - sigStop
+                    sigLimit := close + rrA * risk
+                    float dres = nearestDrawableAbove(anchor)
+                    if not na(dres) and dres - close >= 0.5 * risk
+                        sigLimit := dres                  // level target beats R-multiple
+                pendLevel := na
+    // breakout detection (arm/re-arm the setup)
+    if enableA and sane and not na(res0) and close >= res0 * (1 + brkXPct / 100.0)
+        pendLevel := res0
+        pendBar   := bar_index
+
+    // ---- Component B: big-body momentum with level anti-confluence
+    if enableB and canTrade and not aLong and inRTH
+        float body = math.abs(close - open)
+        float rng  = high - low
+        if rng > 0 and body >= bodyAtrMult * atrB and body / rng >= 0.5 and volume > volMult * vSma
+            float vt = vetoTolPct / 100.0
+            bool vetoL = false
+            bool vetoS = false
+            if array.size(supArr) > 0
+                for k = 0 to math.min(2, array.size(supArr) - 1)
+                    if math.abs(low - array.get(supArr, k)) <= vt * array.get(supArr, k)
+                        vetoL := true
+            if array.size(resArr) > 0
+                for k = 0 to math.min(2, array.size(resArr) - 1)
+                    if math.abs(array.get(resArr, k) - high) <= vt * array.get(resArr, k)
+                        vetoS := true
+            bool roomL = na(res0) or res0 - close > headroomPct / 100.0 * close
+            bool roomS = na(sup0) or close - sup0 > headroomPct / 100.0 * close
+            if close > open and emaF > emaS and not vetoL and roomL
+                bLong   := true
+                sigStop := low * (1 - stopPctB / 100.0)
+                sigLimit := close + rrB * (close - sigStop)
+            else if close < open and emaF < emaS and not vetoS and roomS
+                bShort  := true
+                sigStop := high * (1 + stopPctB / 100.0)
+                sigLimit := close - rrB * (sigStop - close)
+
+    // ---- Component C (experimental, off by default): resistance rejection
+    // in a downtrend with an unfilled FVG below as the magnet/target
+    if enableC and canTrade and not aLong and not bLong and not bShort and not na(res0)
+        float rm = rejMarginPct / 100.0
+        if close[1] < res0 and high >= res0 * (1 - rm) and close < res0 * (1 - rm) and sane and emaF < emaS
+            bool freshOk = true
+            if array.size(rejPx) > 0
+                for k = 0 to array.size(rejPx) - 1
+                    if math.abs(array.get(rejPx, k) - res0) < 0.1 and bar_index - array.get(rejBar, k) < freshBarsC
+                        freshOk := false
+            if freshOk
+                array.push(rejPx, res0)
+                array.push(rejBar, bar_index)
+                if array.size(rejPx) > 50
+                    array.shift(rejPx)
+                    array.shift(rejBar)
+                float gt = na                              // nearest gap top below
+                if array.size(fvgTop) > 0
+                    for k = 0 to array.size(fvgTop) - 1
+                        float t_ = array.get(fvgTop, k)
+                        if t_ < anchor and (na(gt) or t_ > gt)
+                            gt := t_
+                if not na(gt) and (close - gt) / close <= fvgMaxDistPct / 100.0
+                    cShort  := true
+                    sigStop := high * (1 + stopPadC / 100.0)
+                    float riskC = sigStop - close
+                    sigLimit := close - rrC * riskC
+                    if close - gt >= 0.4 * riskC
+                        sigLimit := gt                     // target the gap fill
+
+// ────────────────────────────────────────────────────────────────────────────
+// Per-bar book update (closed bars only)
+// ────────────────────────────────────────────────────────────────────────────
+if barstate.isconfirmed
+    bool htfCompleted = false
+    // -- 1. HTF aggregation ---------------------------------------------------
+    int key = math.floor(time / SPAN_MS)   // v6: int/int division yields float
+    if na(curKey)
+        curKey := key
+        curH := high
+        curL := low
+    else if key == curKey
+        curH := math.max(curH, high)
+        curL := math.min(curL, low)
+    else
+        // An HTF bar just completed: archive it, then check for a pivot.
+        htfCompleted := true
+        array.push(htfH, curH)
+        array.push(htfL, curL)
+        htfCount += 1
+        if array.size(htfH) > MAX_KEEP
+            array.shift(htfH)
+            array.shift(htfL)
+        curKey := key
+        curH := high
+        curL := low
+
+        // -- 2. HTF pivot check (candidate = bar pivStrength back) ----------
+        if htfCount >= 2 * pivStrength + 1
+            int sz = array.size(htfH)
+            int m  = sz - 1 - pivStrength
+            // pivot high: unique max of the 2s+1 window
+            float ph   = array.get(htfH, m)
+            float wMax = -1e18
+            int   nMax = 0
+            for k = sz - 1 - 2 * pivStrength to sz - 1
+                float v = array.get(htfH, k)
+                wMax := math.max(wMax, v)
+                if v == ph
+                    nMax += 1
+            if ph >= wMax and nMax == 1
+                float fMax = -1e18                       // fresh-extreme test
+                for k = 0 to m - 1
+                    fMax := math.max(fMax, array.get(htfH, k))
+                addPivot(ph, ph > fMax)
+            // pivot low (mirror)
+            float pl   = array.get(htfL, m)
+            float wMin = 1e18
+            int   nMin = 0
+            for k = sz - 1 - 2 * pivStrength to sz - 1
+                float v = array.get(htfL, k)
+                wMin := math.min(wMin, v)
+                if v == pl
+                    nMin += 1
+            if pl <= wMin and nMin == 1
+                float fMin = 1e18
+                for k = 0 to m - 1
+                    fMin := math.min(fMin, array.get(htfL, k))
+                addPivot(pl, pl < fMin)
+            evictIfFull()
+
+    // -- 3. Refresh the active set when the book may have changed or price moved
+    float refBase = nz(lastRefPx, close)
+    if htfCompleted or na(lastRefPx) or math.abs(close - refBase) > refBase * 0.005
+        array.clear(activeIdx)
+        if levelCount() > 0
+            for j = 0 to levelCount() - 1
+                if math.abs(array.get(lvPx, j) - close) <= close * 0.02
+                    array.push(activeIdx, j)
+        lastRefPx := close
+
+    // -- 4. Touch counting + wick re-snap (nearby levels only) --------------
+    int nAct = array.size(activeIdx)
+    if nAct > 0
+        for a = 0 to nAct - 1
+            int j = array.get(activeIdx, a)
+            float c = array.get(lvPx, j)
+            float d = c * band
+            if low - d <= c and c <= high + d
+                if bar_index - array.get(lvLastIn, j) >= gapBarsEff
+                    array.set(lvTouches, j, array.get(lvTouches, j) + 1)
+                array.set(lvLastIn, j, bar_index)
+                float w = math.abs(high - c) < math.abs(low - c) ? high : low
+                if math.abs(w - c) <= c * snapTol
+                    array.set(lvSnap, j, w)
+
+    // -- 5. FVG bookkeeping (component C): fills first, then new gap-up zones
+    if array.size(fvgBot) > 0
+        for k = array.size(fvgBot) - 1 to 0
+            if low <= array.get(fvgBot, k)
+                array.remove(fvgBot, k)
+                array.remove(fvgTop, k)
+    if bar_index >= 2 and low > high[2]
+        array.push(fvgBot, high[2])
+        array.push(fvgTop, low)
+        if array.size(fvgBot) > 200
+            array.shift(fvgBot)
+            array.shift(fvgTop)
+
+// ────────────────────────────────────────────────────────────────────────────
+// Order placement + alerts (orders fill on the signal bar's close; ONE
+// consolidated stop+limit exit per entry)
+// ────────────────────────────────────────────────────────────────────────────
+if strategy.position_size == 0
+    inPosB := false
+
+if aLong
+    strategy.entry("A-L", strategy.long)
+    strategy.exit("A-Lx", "A-L", stop = sigStop, limit = sigLimit)
+    lastEntryBar := bar_index
+    entryBarIdx  := bar_index
+if bLong
+    strategy.entry("B-L", strategy.long)
+    strategy.exit("B-Lx", "B-L", stop = sigStop, limit = sigLimit)
+    lastEntryBar := bar_index
+    entryBarIdx  := bar_index
+    inPosB := true
+if bShort
+    strategy.entry("B-S", strategy.short)
+    strategy.exit("B-Sx", "B-S", stop = sigStop, limit = sigLimit)
+    lastEntryBar := bar_index
+    entryBarIdx  := bar_index
+    inPosB := true
+if cShort
+    strategy.entry("C-S", strategy.short)
+    strategy.exit("C-Sx", "C-S", stop = sigStop, limit = sigLimit)
+    lastEntryBar := bar_index
+    entryBarIdx  := bar_index
+
+// B timeout: flat-close a stale momentum position at the bar close
+if barstate.isconfirmed and inPosB and strategy.position_size != 0 and bar_index - entryBarIdx >= timeoutB
+    strategy.close_all(comment = "B timeout")
+
+// alert() (not alertcondition — inert inside strategies). Create ONE alert on
+// this script with condition "Any alert() function call" to receive all.
+if aLong
+    alert("AutoLevels A: breakout-retest long, level " + str.tostring(pendLevel[1], format.mintick), alert.freq_once_per_bar_close)
+if bLong
+    alert("AutoLevels B: big-body momentum long", alert.freq_once_per_bar_close)
+if bShort
+    alert("AutoLevels B: big-body momentum short", alert.freq_once_per_bar_close)
+if cShort
+    alert("AutoLevels C: rejection short, FVG target", alert.freq_once_per_bar_close)
+
+// ────────────────────────────────────────────────────────────────────────────
+// Drawing — recompute the emitted set on the last bar
+// ────────────────────────────────────────────────────────────────────────────
+var array<line>  lvLines  = array.new<line>()
+var array<label> lvLabels = array.new<label>()
+
+// v6: strategies don't run on the unconfirmed realtime bar, so also draw on
+// the last confirmed historical bar — otherwise nothing appears until a bar closes.
+if barstate.islast or barstate.islastconfirmedhistory
+    if array.size(lvLines) > 0
+        for j = 0 to array.size(lvLines) - 1
+            line.delete(array.get(lvLines, j))
+    array.clear(lvLines)
+    if array.size(lvLabels) > 0
+        for j = 0 to array.size(lvLabels) - 1
+            label.delete(array.get(lvLabels, j))
+    array.clear(lvLabels)
+
+    float topPx = strongTopPx()
+    array<float> drawnPx = array.new<float>()
+    if levelCount() > 0
+        for j = 0 to levelCount() - 1
+            [drawnOk, tradOk] = emitOk(j, topPx)
+            if drawnOk
+                float snapPx = array.get(lvSnap, j)
+                if not array.includes(drawnPx, snapPx)   // de-dup exact prices
+                    array.push(drawnPx, snapPx)
+                    bool  strong = array.get(lvStrong, j)
+                    color col    = snapPx > close ? resColor : supColor
+                    array.push(lvLines, line.new(bar_index, snapPx, bar_index + 1, snapPx,
+                         extend = extend.both, color = col, width = strong ? 2 : 1))
+                    if showLabels
+                        string txt = str.tostring(snapPx, format.mintick) + " · " +
+                             str.tostring(array.get(lvTouches, j)) + "t" + (strong ? " ★" : "")
+                        array.push(lvLabels, label.new(bar_index + 2, snapPx, txt,
+                             style = label.style_label_left, color = color.new(col, 82),
+                             textcolor = col, size = size.small))
+
+    // Status table — first thing to check when the chart looks empty.
+    if showStats
+        var table st = table.new(position.bottom_right, 2, 5,
+             bgcolor = color.new(color.gray, 88), border_width = 1,
+             border_color = color.new(color.gray, 70))
+        table.cell(st, 0, 0, "Bars loaded",    text_halign = text.align_left, text_size = size.small, text_color = chart.fg_color)
+        table.cell(st, 1, 0, str.tostring(bar_index + 1),        text_size = size.small, text_color = chart.fg_color)
+        table.cell(st, 0, 1, "HTF bars built", text_halign = text.align_left, text_size = size.small, text_color = chart.fg_color)
+        table.cell(st, 1, 1, str.tostring(htfCount),             text_size = size.small, text_color = chart.fg_color)
+        table.cell(st, 0, 2, "Levels tracked", text_halign = text.align_left, text_size = size.small, text_color = chart.fg_color)
+        table.cell(st, 1, 2, str.tostring(levelCount()),         text_size = size.small, text_color = chart.fg_color)
+        table.cell(st, 0, 3, "Levels drawn",   text_halign = text.align_left, text_size = size.small, text_color = chart.fg_color)
+        table.cell(st, 1, 3, str.tostring(array.size(drawnPx)),  text_size = size.small, text_color = chart.fg_color)
+        string hint = timeframe.in_seconds(timeframe.period) > tfHours * 3600 ?
+             "chart TF coarser than the HTF bucket — use 15m (tuned) or 1h" :
+             array.size(drawnPx) > 0 ? "OK" :
+             htfCount < 2 * pivStrength + 1 ? "warming up — needs " + str.tostring(2 * pivStrength + 1) + " HTF bars" :
+             levelCount() == 0 ? "no HTF pivots confirmed yet — load more history" :
+             "no level passed emission yet — load more history (5k+ bars)"
+        table.cell(st, 0, 4, "Status",         text_halign = text.align_left, text_size = size.small, text_color = chart.fg_color)
+        table.cell(st, 1, 4, hint,                               text_size = size.small, text_color = chart.fg_color)
