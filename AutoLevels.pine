@@ -15,22 +15,27 @@
 // Mar-Jul26; entries at confirmed closes, one consolidated exit per entry):
 //   A. BREAKOUT-RETEST, long only: a sane bar closes ≥0.07% above the nearest
 //      tradable resistance; within 16 bars price retests the flipped level
-//      (low within 0.12%) while closing above it -> long. Stop 0.35% below
-//      the level; target = next drawable level if ≥0.5R away, else 1.5R.
+//      (low within 0.12%) while closing above it -> long. Stop (v1.2) =
+//      0.75xATR14 below the level, floored 0.15% / capped 0.35% ("Fixed %"
+//      input restores v1.1); target = next drawable level if ≥0.5R, else 1.5R.
 //   B. BIG-BODY MOMENTUM, both sides (mined from the user's TrendFollower
 //      work): RTH bar with body ≥1.65xATR(14), body ≥50% of range, volume
 //      >1.5x its SMA20, EMA20/50 aligned with the candle direction. Skipped
 //      if the bar launches off a tradable level (±0.20% veto) or the nearest
 //      opposing level is <0.5% away (headroom). Stop 0.35% past the signal
 //      extreme, 1.5R target, 32-bar timeout.
-//   Validated (1 contract): tune window +$14.3k PF 1.80; hold-out +$3.8k
-//   PF 1.36; every ±20% param perturbation profitable; 2-tick slippage
-//   immune. Realistic forward expectation is the hold-out rate (~$60-70 per
-//   trade, ~15 trades/mo), NOT the tune-window rate. The former demo bounce
-//   layer was removed: it had no edge on clean data.
+//   Validated (1 contract, v1.2): tune window +$15.0k PF 1.98 (maxDD -$2.1k);
+//   hold-out +$5.4k PF 1.61 (maxDD -$1.6k); perturbation-flat; 2-tick
+//   slippage immune. Honest weak spot: the low-volatility melt-up stretch
+//   (Sep25-Mar26) lost ~$3.7k — ATR stops are tight when volatility dies;
+//   "Fixed %" stop mode handled that stretch better (-$0.9k) at the cost of
+//   a weaker hold-out ($3.8k PF 1.36). Realistic forward expectation is the
+//   hold-out rate, NOT the tune-window rate. Tested and REJECTED on data:
+//   session windows for A (off-hours retests work), fewer/stricter levels
+//   (A starves), retest-quality bars, A shorts, ATR stops for B.
 // =============================================================================
 
-strategy("Auto S/R Levels (HTF Pivot Book)", "AutoLevels",
+strategy("Auto S/R Levels v1.2", "AutoLevels v1.2",
      overlay = true,
      max_lines_count = 500,
      max_labels_count = 500,
@@ -91,7 +96,10 @@ cooldownBars  = input.int(16,    "Cooldown between entries (bars)",      minval 
 brkXPct       = input.float(0.07, "Breakout margin (%)",                 minval = 0.04, maxval = 0.15, step = 0.01, group = grpA, tooltip = "A bar must CLOSE this % above the nearest tradable resistance to arm the setup.")
 retestW       = input.int(16,    "Retest window (bars)",                 minval = 8,  maxval = 32,  group = grpA, tooltip = "Bars to wait for the retest; the setup expires after this.")
 retestBandPct = input.float(0.12, "Retest tolerance (%)",                minval = 0.08, maxval = 0.20, step = 0.01, group = grpA, tooltip = "Enter when the bar's low comes back within this % of the flipped level while the close holds above it.")
-stopPctA      = input.float(0.35, "A: stop below level (%)",             minval = 0.20, maxval = 0.50, step = 0.05, group = grpA)
+stopModeA     = input.string("ATR hybrid", "A: stop mode", options = ["ATR hybrid", "Fixed %"], group = grpA, tooltip = "ATR hybrid (v1.2): stop sits 0.75xATR(14) below the level, floored at 0.15% and capped at the fixed % — adapts to volatility; higher PF and smaller drawdowns in testing, but gave back more in the low-volatility melt-up stretch. Fixed % = v1.1 behavior.")
+atrMultA      = input.float(0.75, "A: ATR stop multiple",                minval = 0.50, maxval = 1.25, step = 0.05, group = grpA)
+stopFloorPctA = input.float(0.15, "A: ATR stop floor (%)",               minval = 0.10, maxval = 0.25, step = 0.01, group = grpA)
+stopPctA      = input.float(0.35, "A: fixed stop / ATR cap (%)",         minval = 0.20, maxval = 0.50, step = 0.05, group = grpA, tooltip = "Fixed-mode stop distance below the level; in ATR-hybrid mode this is the cap.")
 rrA           = input.float(1.5,  "A: fallback reward:risk",             minval = 1.0,  maxval = 2.5,  step = 0.25, group = grpA, tooltip = "Used when no drawable level sits at least 0.5R above; otherwise the next level is the target.")
 
 bodyAtrMult   = input.float(1.65, "Min body / ATR(14)",                  minval = 1.2,  maxval = 2.2,  step = 0.05, group = grpB)
@@ -342,7 +350,10 @@ if barstate.isconfirmed
             else
                 if canTrade
                     aLong   := true
-                    sigStop := pendLevel * (1 - stopPctA / 100.0)
+                    float bufA = stopModeA == "ATR hybrid" ?
+                         math.min(math.max(atrMultA * atrB, stopFloorPctA / 100.0 * close), stopPctA / 100.0 * close) :
+                         stopPctA / 100.0 * pendLevel
+                    sigStop := pendLevel - bufA
                     float risk = close - sigStop
                     sigLimit := close + rrA * risk
                     float dres = nearestDrawableAbove(anchor)
