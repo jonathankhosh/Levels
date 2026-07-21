@@ -22,9 +22,12 @@
 // Mar-Jul26; entries at confirmed closes, one consolidated exit per entry):
 //   A. BREAKOUT-RETEST, long only: a sane bar closes ≥0.07% above the nearest
 //      tradable resistance; within 16 bars price retests the flipped level
-//      (low within 0.12%) while closing above it -> long. Stop (v1.2) =
-//      0.75xATR14 below the level, floored 0.15% / capped 0.35% ("Fixed %"
-//      input restores v1.1); target = next drawable level if ≥0.5R, else 1.5R.
+//      (low within 0.12%) while closing above it — then (v1.5) the retest
+//      must PROVE continuation: a close above the touch bar's high within 2
+//      bars, never a close back below the level. Entry skipped when the next
+//      drawable level above is closer than 1.0R (no buying under a ceiling).
+//      Stop = 0.75xATR14 below the level, floored 0.15% / capped 0.35%;
+//      target = next drawable level if ≥0.5R, else 1.5R.
 //   B. BIG-BODY MOMENTUM, both sides (mined from the user's TrendFollower
 //      work): RTH bar with body ≥1.65xATR(14), body ≥50% of range, volume
 //      >1.5x its SMA20, EMA20/50 aligned with the candle direction. Skipped
@@ -36,11 +39,12 @@
 //   over EMA150-260); ALL entries are skipped in chop (ADX14 < 20); shorts
 //   were already trend-gated (EMA20/50); A always waits for the retest —
 //   it never buys the breakout bar itself.
-//   Validated (1 contract, v1.4): tune window +$12.6k PF 2.47 (maxDD
-//   -$1.0k); hold-out +$3.5k PF 2.00 (maxDD -$1.2k); vs v1.3 the gates
-//   trade net for quality: fewer trades, PF up ~30%, drawdowns ~35%
-//   smaller. Melt-up stretch still the weak spot (-$3.6k). Realistic
-//   forward expectation is the hold-out rate, NOT the tune-window rate.
+//   Validated (1 contract, v1.5): tune window +$11.4k PF 2.72 (maxDD
+//   -$1.5k); hold-out +$4.4k PF 2.47 (maxDD -$1.2k); melt-up stretch
+//   -$2.6k (improving each version). Headroom-only (proof off) scored
+//   best in-sample (PF 2.83) with more trades — toggle "continuation
+//   proof" off to get it. Realistic forward expectation is the hold-out
+//   rate, NOT the tune-window rate.
 //   Tested and REJECTED on data: volume-confirmed breakout arming, strict
 //   short gates (EMA50/200 or daily EMA — neutral), trend gate on B longs
 //   (double-gating starves it), session windows for A, fewer/stricter
@@ -48,7 +52,7 @@
 //   averaged line price (draw the average, trade the wick).
 // =============================================================================
 
-strategy("Auto S/R Levels v1.4", "AutoLevels v1.4",
+strategy("Auto S/R Levels v1.5", "AutoLevels v1.5",
      overlay = true,
      max_lines_count = 500,
      max_labels_count = 500,
@@ -113,7 +117,10 @@ chopAdx       = input.float(20,  "Skip entries when ADX(14) below",      minval 
 
 brkXPct       = input.float(0.07, "Breakout margin (%)",                 minval = 0.04, maxval = 0.15, step = 0.01, group = grpA, tooltip = "A bar must CLOSE this % above the nearest tradable resistance to arm the setup.")
 retestW       = input.int(16,    "Retest window (bars)",                 minval = 8,  maxval = 32,  group = grpA, tooltip = "Bars to wait for the retest; the setup expires after this.")
-retestBandPct = input.float(0.12, "Retest tolerance (%)",                minval = 0.08, maxval = 0.20, step = 0.01, group = grpA, tooltip = "Enter when the bar's low comes back within this % of the flipped level while the close holds above it.")
+retestBandPct = input.float(0.12, "Retest tolerance (%)",                minval = 0.08, maxval = 0.20, step = 0.01, group = grpA, tooltip = "The retest touch: the bar's low comes back within this % of the flipped level while the close holds above it.")
+confirmRetest = input.bool(true,  "Require continuation proof",          group = grpA, tooltip = "v1.5: the touch alone is not the trigger — after the retest holds, wait for a close above the touch bar's high (within the window below) before going long. Cancels if any close falls back below the level.")
+confirmWindow = input.int(2,     "Continuation window (bars)",           minval = 1,  maxval = 4,   group = grpA)
+minHeadroomR  = input.float(1.0,  "Min headroom to next level (R)",      minval = 0.0, maxval = 2.0, step = 0.25, group = grpA, tooltip = "v1.5: skip the entry when the next drawable level above is closer than this many R — no buying right under a ceiling. 0 disables.")
 stopModeA     = input.string("ATR hybrid", "A: stop mode", options = ["ATR hybrid", "Fixed %"], group = grpA, tooltip = "ATR hybrid (v1.2): stop sits 0.75xATR(14) below the level, floored at 0.15% and capped at the fixed % — adapts to volatility; higher PF and smaller drawdowns in testing, but gave back more in the low-volatility melt-up stretch. Fixed % = v1.1 behavior.")
 atrMultA      = input.float(0.75, "A: ATR stop multiple",                minval = 0.50, maxval = 1.25, step = 0.05, group = grpA)
 stopFloorPctA = input.float(0.15, "A: ATR stop floor (%)",               minval = 0.10, maxval = 0.25, step = 0.01, group = grpA)
@@ -326,6 +333,10 @@ bool adxOk = chopAdx <= 0 or adxV >= chopAdx
 var int   lastEntryBar = -1000000
 var float pendLevel    = na       // armed breakout level awaiting retest
 var int   pendBar      = na
+var float waitLvl      = na       // v1.5: touched level awaiting continuation proof
+var float waitHigh     = na       // the touch bar's high (must be closed above)
+var int   waitBar      = na
+var float aEntryLvl    = na       // level behind the current A entry (for alerts)
 var int   entryBarIdx  = na
 var bool  inPosB       = false    // current position opened by component B
 
@@ -367,28 +378,47 @@ if barstate.isconfirmed
     float res0 = array.size(resArr) > 0 ? array.get(resArr, 0) : na
     bool  sane = math.abs(close / close[1] - 1) <= 0.01   // freak-bar guard
 
-    // ---- Component A: retest check first (a breakout bar can't be its own retest)
+    // ---- Component A stage 2 (v1.5): continuation proof after a held touch.
+    // The retest touch is NOT the trigger — the level must show the move is
+    // continuing (a close above the touch bar's high) before a long is taken.
+    float aTryLvl = na
+    if enableA and not na(waitLvl)
+        if close < waitLvl or bar_index - waitBar > confirmWindow
+            waitLvl := na                                 // proof failed / expired
+        else if sane and close > waitHigh
+            aTryLvl := waitLvl                            // continuation proven
+            waitLvl := na
+    // ---- Component A stage 1: retest check (a breakout bar can't be its own retest)
     if enableA and not na(pendLevel)
         if close < pendLevel
             pendLevel := na                               // failed break
         else if bar_index - pendBar > retestW
             pendLevel := na                               // expired
         else if low <= pendLevel * (1 + retestBandPct / 100.0)
-            if not sane
-                pendLevel := na
-            else
-                if canTrade and trendOkA
-                    aLong   := true
-                    float bufA = stopModeA == "ATR hybrid" ?
-                         math.min(math.max(atrMultA * atrB, stopFloorPctA / 100.0 * close), stopPctA / 100.0 * close) :
-                         stopPctA / 100.0 * pendLevel
-                    sigStop := pendLevel - bufA
-                    float risk = close - sigStop
-                    sigLimit := close + rrA * risk
-                    float dres = nearestDrawableAbove(anchor)
-                    if not na(dres) and dres - close >= 0.5 * risk
-                        sigLimit := dres                  // level target beats R-multiple
-                pendLevel := na
+            if sane
+                if confirmRetest
+                    waitLvl  := pendLevel                 // wait for proof
+                    waitHigh := high
+                    waitBar  := bar_index
+                else
+                    aTryLvl := pendLevel                  // legacy: enter on the touch
+            pendLevel := na
+    // ---- Component A entry attempt (gates + headroom, then stop/target)
+    if not na(aTryLvl) and canTrade and trendOkA
+        float bufA = stopModeA == "ATR hybrid" ?
+             math.min(math.max(atrMultA * atrB, stopFloorPctA / 100.0 * close), stopPctA / 100.0 * close) :
+             stopPctA / 100.0 * aTryLvl
+        float stopPxA = aTryLvl - bufA
+        float riskA   = close - stopPxA
+        float dres    = nearestDrawableAbove(anchor)
+        bool  roomOk  = minHeadroomR <= 0 or na(dres) or dres - close >= minHeadroomR * riskA
+        if riskA > syminfo.mintick and roomOk
+            aLong   := true
+            sigStop := stopPxA
+            sigLimit := close + rrA * riskA
+            if not na(dres) and dres - close >= 0.5 * riskA
+                sigLimit := dres                          // level target beats R-multiple
+            aEntryLvl := aTryLvl
     // breakout detection (arm/re-arm the setup)
     if enableA and sane and not na(res0) and close >= res0 * (1 + brkXPct / 100.0)
         pendLevel := res0
@@ -599,7 +629,7 @@ if barstate.isconfirmed and inPosB and strategy.position_size != 0 and bar_index
 // alert() (not alertcondition — inert inside strategies). Create ONE alert on
 // this script with condition "Any alert() function call" to receive all.
 if aLong
-    alert("AutoLevels A: breakout-retest long, level " + str.tostring(pendLevel[1], format.mintick), alert.freq_once_per_bar_close)
+    alert("AutoLevels A: breakout-retest long, level " + str.tostring(aEntryLvl, format.mintick), alert.freq_once_per_bar_close)
 if bLong
     alert("AutoLevels B: big-body momentum long", alert.freq_once_per_bar_close)
 if bShort
