@@ -31,19 +31,24 @@
 //      if the bar launches off a tradable level (±0.20% veto) or the nearest
 //      opposing level is <0.5% away (headroom). Stop 0.35% past the signal
 //      extreme, 1.5R target, 32-bar timeout.
-//   Validated (1 contract, v1.3 levels): tune window +$13.6k PF 1.90 (maxDD
-//   -$1.7k); hold-out +$5.3k PF 1.66 (maxDD -$1.4k); perturbation-flat;
-//   2-tick slippage immune. Honest weak spot: the low-volatility melt-up
-//   stretch (Sep25-Mar26) lost ~$4.4k — ATR stops are tight when volatility
-//   dies; "Fixed %" stop mode handled that regime better at the cost of a
-//   weaker hold-out. Realistic forward expectation is the hold-out rate,
-//   NOT the tune-window rate. Tested and REJECTED on data: session windows
-//   for A (off-hours retests work), fewer/stricter levels (A starves),
-//   retest-quality bars, A shorts, ATR stops for B, and trading the
+//   v1.4 GATES (the trader's rules, definitions chosen on the tune window):
+//   A longs are BLOCKED in a clear downtrend (EMA50<EMA200; flat optimum
+//   over EMA150-260); ALL entries are skipped in chop (ADX14 < 20); shorts
+//   were already trend-gated (EMA20/50); A always waits for the retest —
+//   it never buys the breakout bar itself.
+//   Validated (1 contract, v1.4): tune window +$12.6k PF 2.47 (maxDD
+//   -$1.0k); hold-out +$3.5k PF 2.00 (maxDD -$1.2k); vs v1.3 the gates
+//   trade net for quality: fewer trades, PF up ~30%, drawdowns ~35%
+//   smaller. Melt-up stretch still the weak spot (-$3.6k). Realistic
+//   forward expectation is the hold-out rate, NOT the tune-window rate.
+//   Tested and REJECTED on data: volume-confirmed breakout arming, strict
+//   short gates (EMA50/200 or daily EMA — neutral), trend gate on B longs
+//   (double-gating starves it), session windows for A, fewer/stricter
+//   levels, retest-quality bars, A shorts, ATR stops for B, trading the
 //   averaged line price (draw the average, trade the wick).
 // =============================================================================
 
-strategy("Auto S/R Levels v1.3", "AutoLevels v1.3",
+strategy("Auto S/R Levels v1.4", "AutoLevels v1.4",
      overlay = true,
      max_lines_count = 500,
      max_labels_count = 500,
@@ -103,6 +108,8 @@ enableA       = input.bool(true,  "Enable A · breakout-retest longs",    group 
 enableB       = input.bool(true,  "Enable B · big-body momentum",        group = grpX)
 enableC       = input.bool(false, "Enable C · rejection short + FVG (experimental)", group = grpX, tooltip = "Short a resistance rejection in a downtrend when an unfilled fair-value gap sits below as a magnet. Solo stats: tune PF 1.35, hold-out PF 1.27 — real but weaker than A/B, and it steals some A/B entries (one position at a time). OFF by default; enable to forward-test.")
 cooldownBars  = input.int(16,    "Cooldown between entries (bars)",      minval = 0,  maxval = 200, group = grpX, tooltip = "Shared by all components. 16 x 15m = 4h.")
+trendGateA    = input.string("EMA50 vs EMA200", "Block A longs in a downtrend by", options = ["Off", "EMA20 vs EMA50", "EMA50 vs EMA200", "Price vs daily EMA"], group = grpX, tooltip = "No breakout-retest longs while the market is in a clear downtrend. EMA50 vs EMA200 tested best (tune PF 1.90 -> 2.17, hold-out 1.66 -> 2.04, drawdowns ~40% smaller); flat optimum across EMA150-260. Shorts are already trend-gated by their EMA20/50 alignment.")
+chopAdx       = input.float(20,  "Skip entries when ADX(14) below",      minval = 0,  maxval = 30, step = 1, group = grpX, tooltip = "Chop filter: no entries (any component) while ADX(14) is under this. 0 disables. 20 tested best in-sample (PF 2.47, dd -$1.0k); it trades quality for quantity — expect fewer trades.")
 
 brkXPct       = input.float(0.07, "Breakout margin (%)",                 minval = 0.04, maxval = 0.15, step = 0.01, group = grpA, tooltip = "A bar must CLOSE this % above the nearest tradable resistance to arm the setup.")
 retestW       = input.int(16,    "Retest window (bars)",                 minval = 8,  maxval = 32,  group = grpA, tooltip = "Bars to wait for the retest; the setup expires after this.")
@@ -300,7 +307,15 @@ float atrB  = ta.atr(14)
 float vSma  = ta.sma(volume, 20)
 float emaF  = ta.ema(close, 20)
 float emaS  = ta.ema(close, 50)
+float emaXL = ta.ema(close, 200)
+float emaDl = ta.ema(close, 1920)      // ~20-day EMA proxy on 15m bars
+[diPlus, diMinus, adxV] = ta.dmi(14, 14)
 bool  inRTH = not na(time(timeframe.period, "0930-1600", "America/New_York"))
+// v1.4 gates: no counter-trend A longs, no entries in chop
+bool trendOkA = trendGateA == "Off" ? true :
+     trendGateA == "EMA20 vs EMA50"  ? emaF > emaS :
+     trendGateA == "EMA50 vs EMA200" ? emaS > emaXL : close > emaDl
+bool adxOk = chopAdx <= 0 or adxV >= chopAdx
 
 // ────────────────────────────────────────────────────────────────────────────
 // Strategy signals — evaluated BEFORE this bar's book update, so entries react
@@ -323,7 +338,7 @@ float sigLimit = na
 // closedtrades guard: no reentry on the same bar an intrabar exit filled
 // (the validated engine never does this)
 bool  canTrade = strategy.position_size == 0 and bar_index - lastEntryBar >= cooldownBars and
-     strategy.closedtrades == nz(strategy.closedtrades[1])
+     strategy.closedtrades == nz(strategy.closedtrades[1]) and adxOk
 int   minTradeTouch = 10   // pinned: do NOT derive from emission inputs (v1.3 — derived would fall to 9, measurably worse)
 
 if barstate.isconfirmed
@@ -362,7 +377,7 @@ if barstate.isconfirmed
             if not sane
                 pendLevel := na
             else
-                if canTrade
+                if canTrade and trendOkA
                     aLong   := true
                     float bufA = stopModeA == "ATR hybrid" ?
                          math.min(math.max(atrMultA * atrB, stopFloorPctA / 100.0 * close), stopPctA / 100.0 * close) :
