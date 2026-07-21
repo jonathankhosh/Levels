@@ -6,10 +6,17 @@
 // would hand-draw. 15m bars are bucketed into 1h bars; a confirmed 1h pivot
 // (strength 8, unique in its window) creates a level at the exact pivot wick
 // or merges into the nearest level within 0.20%. A pivot that is also a fresh
-// 400-hour extreme is "strong". Bars touching a level's ±0.09% band count
-// distinct touches (≥6h apart); the drawn price re-snaps to the latest
-// reaction wick. Levels earn their line via touch-count emission rules and
-// are never retired. Fully causal — closed bars only, no request.security.
+// 400-hour extreme is "strong". Bars touching a level's ±0.07% band count
+// distinct touches (≥6h apart). The DRAWN price (v1.3) is the running average
+// (EWM λ=0.10) of the touch spread — one sample per distinct touch, a mix of
+// the nearest candle body edge and wick, accepted within 0.09% of center —
+// i.e. the line sits where candles repeatedly land, not on the latest wick.
+// The STRATEGY still trades the wick-snap price (averaged prices in the
+// trading path were tested and collapse the hold-out edge). Levels earn their
+// line via touch-count emission rules (retuned on repaired data) and are
+// never retired. Fully causal — closed bars only, no request.security.
+// Level score vs the trader's 17 hand-drawn lines: 8/17 exact (was 4),
+// 12/17 within 30pts (was 10), mean placement error 9.0 pts (was 15.2).
 //
 // STRATEGY (validated on cleaned MNQ 15m data, tuned Sep24-Aug25, held-out
 // Mar-Jul26; entries at confirmed closes, one consolidated exit per entry):
@@ -24,18 +31,19 @@
 //      if the bar launches off a tradable level (±0.20% veto) or the nearest
 //      opposing level is <0.5% away (headroom). Stop 0.35% past the signal
 //      extreme, 1.5R target, 32-bar timeout.
-//   Validated (1 contract, v1.2): tune window +$15.0k PF 1.98 (maxDD -$2.1k);
-//   hold-out +$5.4k PF 1.61 (maxDD -$1.6k); perturbation-flat; 2-tick
-//   slippage immune. Honest weak spot: the low-volatility melt-up stretch
-//   (Sep25-Mar26) lost ~$3.7k — ATR stops are tight when volatility dies;
-//   "Fixed %" stop mode handled that stretch better (-$0.9k) at the cost of
-//   a weaker hold-out ($3.8k PF 1.36). Realistic forward expectation is the
-//   hold-out rate, NOT the tune-window rate. Tested and REJECTED on data:
-//   session windows for A (off-hours retests work), fewer/stricter levels
-//   (A starves), retest-quality bars, A shorts, ATR stops for B.
+//   Validated (1 contract, v1.3 levels): tune window +$13.6k PF 1.90 (maxDD
+//   -$1.7k); hold-out +$5.3k PF 1.66 (maxDD -$1.4k); perturbation-flat;
+//   2-tick slippage immune. Honest weak spot: the low-volatility melt-up
+//   stretch (Sep25-Mar26) lost ~$4.4k — ATR stops are tight when volatility
+//   dies; "Fixed %" stop mode handled that regime better at the cost of a
+//   weaker hold-out. Realistic forward expectation is the hold-out rate,
+//   NOT the tune-window rate. Tested and REJECTED on data: session windows
+//   for A (off-hours retests work), fewer/stricter levels (A starves),
+//   retest-quality bars, A shorts, ATR stops for B, and trading the
+//   averaged line price (draw the average, trade the wick).
 // =============================================================================
 
-strategy("Auto S/R Levels v1.2", "AutoLevels v1.2",
+strategy("Auto S/R Levels v1.3", "AutoLevels v1.3",
      overlay = true,
      max_lines_count = 500,
      max_labels_count = 500,
@@ -66,20 +74,23 @@ freshLookback = input.int(400,   "Fresh-extreme lookback (HTF bars)",    minval 
 mergeTolPct   = input.float(0.20, "Merge tolerance (%)",                 minval = 0.10, maxval = 0.30, step = 0.01, group = grpD, tooltip = "A new pivot within this % of an existing level's center merges into it instead of creating a new level.")
 promoteTolPct = input.float(0.08, "Strong-pivot separation (%)",         minval = 0.05, maxval = 0.15, step = 0.01, group = grpD, tooltip = "A STRONG pivot farther than this % from every level always starts its own level, even inside merge tolerance.")
 alphaNudge    = input.float(0.25, "Center nudge per merged pivot",       minval = 0.10, maxval = 0.50, step = 0.05, group = grpD, tooltip = "How far the level center drifts toward each newly merged pivot (0.25 = 25% of the distance).")
-bandPct       = input.float(0.09, "Touch band half-width (%)",           minval = 0.06, maxval = 0.12, step = 0.01, group = grpD, tooltip = "A bar whose band-extended range contains the level center registers zone contact.")
+bandPct       = input.float(0.07, "Touch band half-width (%)",           minval = 0.06, maxval = 0.12, step = 0.01, group = grpD, tooltip = "A bar whose band-extended range contains the level center registers zone contact.")
+inclPct       = input.float(0.09, "Draw: sample inclusion radius (%)",   minval = 0.05, maxval = 0.20, step = 0.01, group = grpD, tooltip = "A touch-event sample enters the drawn-price average only within this % of the level center.")
+lamDrawn      = input.float(0.10, "Draw: average decay (lambda)",        minval = 0.05, maxval = 0.50, step = 0.05, group = grpD, tooltip = "EWM weight of each new sample in the drawn price. The drawn line is the running average of the touch spread — where candle bodies/wicks repeatedly land — not the latest wick.")
+mixW          = input.float(0.5,  "Draw: body weight in sample",         minval = 0.0,  maxval = 1.0,  step = 0.25, group = grpD, tooltip = "Sample = mixW * nearest body edge + (1-mixW) * nearest wick extreme.")
 snapTolPct    = input.float(0.30, "Wick re-snap radius (%)",             minval = 0.15, maxval = 0.40, step = 0.01, group = grpD, tooltip = "The drawn price follows the latest bar high/low within this % of the center — lines sit on exact candle wicks.")
 gapHours      = input.float(6.0, "Hours between distinct touches",       minval = 1.0, maxval = 12.0, step = 0.5, group = grpD, tooltip = "Zone contacts separated by at least this long count as separate touch events. Converted to chart bars automatically (6h = 24 bars on 15m, 6 bars on 1h), so the touch cadence is the same on any timeframe.")
 
-recentDays    = input.int(35,    "Young-level age cutoff (days)",        minval = 25, maxval = 45,  group = grpE, tooltip = "Levels younger than this use the young touch threshold; older levels face the stricter old-level rules. Days are measured in traded bars (96 x 15m = 1 day).")
+recentDays    = input.int(33,    "Young-level age cutoff (days)",        minval = 25, maxval = 45,  group = grpE, tooltip = "Levels younger than this use the young touch threshold; older levels face the stricter old-level rules. Days are measured in traded bars (96 x 15m = 1 day).")
 tYoung        = input.int(11,    "Young: min touches",                   minval = 8,  maxval = 14,  group = grpE)
-tOldStrong    = input.int(24,    "Old strong: min touches",              minval = 18, maxval = 32,  group = grpE)
-pOldStrong    = input.int(9,     "Old strong: max merged pivots",        minval = 6,  maxval = 12,  group = grpE, tooltip = "Levels that absorbed too many pivots are blurry chop zones, not crisp lines.")
+tOldStrong    = input.int(22,    "Old strong: min touches",              minval = 18, maxval = 32,  group = grpE)
+pOldStrong    = input.int(7,     "Old strong: max merged pivots",        minval = 6,  maxval = 12,  group = grpE, tooltip = "Levels that absorbed too many pivots are blurry chop zones, not crisp lines.")
 tOldWeak      = input.int(40,    "Old non-strong: min touches",          minval = 36, maxval = 48,  group = grpE)
-pOldWeak      = input.int(7,     "Old non-strong: max merged pivots",    minval = 5,  maxval = 9,   group = grpE)
-tShelf        = input.int(14,    "Crisp shelf: min touches",             minval = 12, maxval = 18,  group = grpE, tooltip = "Old level alternative: one clean price respected repeatedly (very few merged pivots).")
-pShelf        = input.int(2,     "Crisp shelf: max merged pivots",       minval = 1,  maxval = 3,   group = grpE)
-tRescue       = input.int(10,    "Fresh-extreme rescue: min touches",    minval = 6,  maxval = 12,  group = grpE, tooltip = "A STRONG (fresh-extreme) level this young is drawn once it has these touches, even if other rules fail.")
-rescueDays    = input.int(45,    "Fresh-extreme rescue: max age (days)", minval = 35, maxval = 55,  group = grpE)
+pOldWeak      = input.int(9,     "Old non-strong: max merged pivots",    minval = 5,  maxval = 9,   group = grpE)
+tShelf        = input.int(12,    "Crisp shelf: min touches",             minval = 12, maxval = 18,  group = grpE, tooltip = "Old level alternative: one clean price respected repeatedly (very few merged pivots).")
+pShelf        = input.int(3,     "Crisp shelf: max merged pivots",       minval = 1,  maxval = 3,   group = grpE)
+tRescue       = input.int(9,     "Fresh-extreme rescue: min touches",    minval = 6,  maxval = 12,  group = grpE, tooltip = "A STRONG (fresh-extreme) level this young is drawn once it has these touches, even if other rules fail.")
+rescueDays    = input.int(50,    "Fresh-extreme rescue: max age (days)", minval = 35, maxval = 55,  group = grpE)
 topZonePct    = input.float(0.30, "Chart-top zone depth (%)",            minval = 0.20, maxval = 0.50, step = 0.05, group = grpE, tooltip = "STRONG levels within this % of the highest strong level always draw — the shelf under the highs is always marked. Draw-only: these lines are not traded until they earn touches.")
 maxLevels     = input.int(500,   "Level book safety cap",                minval = 100, maxval = 500, group = grpE)
 
@@ -162,6 +173,7 @@ var array<int>   lvBorn    = array.new<int>()    // bar_index at creation
 var array<int>   lvLastIn  = array.new<int>()    // last bar inside the band
 var array<int>   lvNpiv    = array.new<int>()    // HTF pivots merged in
 var array<bool>  lvStrong  = array.new<bool>()   // ever a fresh K-bar extreme
+var array<float> lvDrawn   = array.new<float>()  // drawn price: EWM of touch-spread samples (na until first sample)
 
 // ────────────────────────────────────────────────────────────────────────────
 // Level-book operations
@@ -177,6 +189,7 @@ appendLevel(float px, bool strong) =>
     array.push(lvLastIn, bar_index)
     array.push(lvNpiv, 1)
     array.push(lvStrong, strong)
+    array.push(lvDrawn, float(na))
 
 removeLevel(int j) =>
     array.remove(lvPx, j)
@@ -186,6 +199,7 @@ removeLevel(int j) =>
     array.remove(lvLastIn, j)
     array.remove(lvNpiv, j)
     array.remove(lvStrong, j)
+    array.remove(lvDrawn, j)
 
 // Create a new level from a confirmed HTF pivot, or merge it into the nearest
 // existing level within tolerance. Strong pivots keep their own line unless an
@@ -310,7 +324,7 @@ float sigLimit = na
 // (the validated engine never does this)
 bool  canTrade = strategy.position_size == 0 and bar_index - lastEntryBar >= cooldownBars and
      strategy.closedtrades == nz(strategy.closedtrades[1])
-int   minTradeTouch = math.min(math.min(tYoung, tShelf), math.min(tOldStrong, tRescue))
+int   minTradeTouch = 10   // pinned: do NOT derive from emission inputs (v1.3 — derived would fall to 9, measurably worse)
 
 if barstate.isconfirmed
     // nearest tradable levels around the prior close, from the active set
@@ -493,7 +507,7 @@ if barstate.isconfirmed
                     array.push(activeIdx, j)
         lastRefPx := close
 
-    // -- 4. Touch counting + wick re-snap (nearby levels only) --------------
+    // -- 4. Touch counting + drawn-price average + wick re-snap -------------
     int nAct = array.size(activeIdx)
     if nAct > 0
         for a = 0 to nAct - 1
@@ -503,7 +517,19 @@ if barstate.isconfirmed
             if low - d <= c and c <= high + d
                 if bar_index - array.get(lvLastIn, j) >= gapBarsEff
                     array.set(lvTouches, j, array.get(lvTouches, j) + 1)
+                    // v1.3: one touch-spread sample per distinct touch event.
+                    // The drawn line is the running average of where candle
+                    // bodies/wicks repeatedly land — not the latest wick.
+                    float bodyLo = math.min(open, close)
+                    float bodyHi = math.max(open, close)
+                    float be = math.abs(bodyLo - c) < math.abs(bodyHi - c) ? bodyLo : bodyHi
+                    float wk = math.abs(high - c)   < math.abs(low - c)    ? high   : low
+                    float x  = mixW * be + (1.0 - mixW) * wk
+                    if math.abs(x - c) <= c * (inclPct / 100.0)
+                        float dcur = array.get(lvDrawn, j)
+                        array.set(lvDrawn, j, na(dcur) ? x : dcur + lamDrawn * (x - dcur))
                 array.set(lvLastIn, j, bar_index)
+                // UNCHANGED: wick re-snap — this is the TRADING price (lvSnap)
                 float w = math.abs(high - c) < math.abs(low - c) ? high : low
                 if math.abs(w - c) <= c * snapTol
                     array.set(lvSnap, j, w)
@@ -590,7 +616,8 @@ if barstate.islast or barstate.islastconfirmedhistory
         for j = 0 to levelCount() - 1
             [drawnOk, tradOk] = emitOk(j, topPx)
             if drawnOk
-                float snapPx = array.get(lvSnap, j)
+                float dpx    = array.get(lvDrawn, j)
+                float snapPx = na(dpx) ? array.get(lvPx, j) : dpx   // v1.3: touch-spread average; center until first sample
                 if not array.includes(drawnPx, snapPx)   // de-dup exact prices
                     array.push(drawnPx, snapPx)
                     bool  strong = array.get(lvStrong, j)
