@@ -18,9 +18,19 @@
 //      episodes ≥10 days apart, decayed weight, few body-throughs. Level =
 //      midpoint of the episode-representative spread; flip-pairs emit the
 //      gap midpoint between adjacent opposite-direction clusters.
-// SYNTHESIS: pool both lists, mean-linkage cluster at 0.15%, place at the
-// cluster mean, rank two-detector agreements first, keep ≥0.14% apart, cap
-// 12 lines inside the trailing 60-day range. Validated vs the trader's
+// SYNTHESIS (v2.1): pool both lists, mean-linkage cluster at 0.15%, place at
+// the cluster mean, and emit ONLY two-detector consensus lines (highest
+// confidence), ≥0.14% apart, cap 12 inside the trailing 60-day range. The
+// same line set (refreshed every 24 completed 4h buckets) feeds component R.
+// TRADING (v2.1, per the trader's directive): component R only by default —
+// short when RSI(18) ≥ 65 and the bar breaks above the nearest boundary
+// line (expected rejection); long when RSI(18) ≤ 30 and it breaks below.
+// Stop 0.15% past the break extreme; target = opposite line if ≥0.5R, else
+// 1.5R. HONEST BACKTEST: this rule was NEGATIVE on the 2024-25 tune window
+// in every tested variant (PF 0.43-0.86 — it fades momentum); trend-gated
+// versions produced too few trades to matter. It ships because the trader
+// directed it; the hidden forward window is the judge. The validated v1.5
+// components (A breakout-retest, B big-body) remain available via toggles. Validated vs the trader's
 // cursor-marked levels (30745 / 30231.5 / 28751.5): all found from pre-cut
 // data with 9.9 / 5.7 / 0.9 pt placement error; 12/17 of the older hand
 // lines also found; sane density at earlier cut dates; no repaint.
@@ -63,7 +73,7 @@
 //   averaged line price (draw the average, trade the wick).
 // =============================================================================
 
-strategy("Auto S/R Levels v2.0", "AutoLevels v2.0",
+strategy("Auto S/R Levels v2.1", "AutoLevels v2.1",
      overlay = true,
      max_lines_count = 500,
      max_labels_count = 500,
@@ -121,8 +131,13 @@ showStats     = input.bool(true,  "Show status table",                   group =
 supColor      = input.color(color.new(#26a69a, 0), "Support line color",    group = grpV)
 resColor      = input.color(color.new(#ef5350, 0), "Resistance line color", group = grpV)
 
-enableA       = input.bool(true,  "Enable A · breakout-retest longs",    group = grpX)
-enableB       = input.bool(true,  "Enable B · big-body momentum",        group = grpX)
+enableR       = input.bool(true,  "Enable R · RSI rejection at boundary lines", group = grpX, tooltip = "The trader's rule: short when RSI(18) >= 65 and price just breaks above a consensus boundary line (expect rejection); long when RSI(18) <= 30 and price breaks below one. HONEST BACKTEST NOTE: negative on the 2024-25 tune window in every tested variant (fading momentum); forward test is the judge.")
+rsiShortMin   = input.float(65,  "R: shorts need RSI(18) at or above",   minval = 55, maxval = 85, step = 1, group = grpX)
+rsiLongMax    = input.float(30,  "R: longs need RSI(18) at or below",    minval = 15, maxval = 45, step = 1, group = grpX)
+rPadPct       = input.float(0.15, "R: stop beyond break extreme (%)",    minval = 0.10, maxval = 0.40, step = 0.05, group = grpX)
+rrR           = input.float(1.5,  "R: reward:risk",                      minval = 1.0, maxval = 2.5, step = 0.25, group = grpX, tooltip = "Target = opposite boundary line when >=0.5R away, else this multiple.")
+enableA       = input.bool(false, "Enable A · breakout-retest longs",    group = grpX, tooltip = "v1.5 component (validated: tune PF 2.72, hold-out PF 2.47 on the dense book). Off by default per the only-R directive; toggle on to combine.")
+enableB       = input.bool(false, "Enable B · big-body momentum",        group = grpX, tooltip = "v1.5 component (validated). Off by default per the only-R directive; toggle on to combine.")
 enableC       = input.bool(false, "Enable C · rejection short + FVG (experimental)", group = grpX, tooltip = "Short a resistance rejection in a downtrend when an unfilled fair-value gap sits below as a magnet. Solo stats: tune PF 1.35, hold-out PF 1.27 — real but weaker than A/B, and it steals some A/B entries (one position at a time). OFF by default; enable to forward-test.")
 cooldownBars  = input.int(16,    "Cooldown between entries (bars)",      minval = 0,  maxval = 200, group = grpX, tooltip = "Shared by all components. 16 x 15m = 4h.")
 trendGateA    = input.string("EMA50 vs EMA200", "Block A longs in a downtrend by", options = ["Off", "EMA20 vs EMA50", "EMA50 vs EMA200", "Price vs daily EMA"], group = grpX, tooltip = "No breakout-retest longs while the market is in a clear downtrend. EMA50 vs EMA200 tested best (tune PF 1.90 -> 2.17, hold-out 1.66 -> 2.04, drawdowns ~40% smaller); flat optimum across EMA150-260. Shorts are already trend-gated by their EMA20/50 alignment.")
@@ -424,6 +439,10 @@ var array<float> m3Px    = array.new<float>()
 var array<int> dKey = array.new<int>()
 var array<float> dHi = array.new<float>()
 var array<float> dLo = array.new<float>()
+// tier-2 boundary lines for TRADING (refreshed every 24 completed 4h buckets)
+var array<float> trdP = array.new<float>()
+var array<int>   trdT = array.new<int>()
+var int synthPend = 999
 
 b1Count() =>
     array.size(b1Px)
@@ -629,6 +648,272 @@ d3Add(float px, float day, int dir, float w) =>
             array.set(c3Sw, worst, 0.0)
     true    // uniform return type across all branches
 
+// Full boundary synthesis: D1 emission + D3 promotion (single member pass) +
+// tier-2-only consensus. Fills outP/outT (tier always 2). Called every 24
+// completed 4h buckets for the trading line set, and at the last bar to draw.
+bSynthInto(array<float> outP, array<int> outT) =>
+    array.clear(outP)
+    array.clear(outT)
+    // ---- D1 emission ----
+    array<float> d1P = array.new<float>()
+    array<float> d1S = array.new<float>()
+    if b1Count() > 0
+        for j = 0 to b1Count() - 1
+            int eps_  = array.get(b1Eps, j)
+            int zone_ = array.get(b1Zone, j)
+            int ca_   = array.get(b1Ca, j)
+            int cb_   = array.get(b1Cb, j)
+            bool pass = eps_ >= B1_MINEP and array.get(b1Dep, j) >= B1_MINDEP and
+                 zone_ >= B1_ZONEMIN and
+                 zone_ / math.max(1, eps_) <= B1_DWELLMX and
+                 array.get(b1Bt, j) / math.max(1, zone_) <= B1_BTMAX and
+                 math.min(ca_, cb_) >= B1_FLIPMIN and
+                 array.get(b1Last, j) - array.get(b1First, j) >= B1_SPANMIN
+            if pass
+                array.push(d1P, array.get(b1NSmp, j) > 0 ?
+                     array.get(b1Sum, j) / array.get(b1NSmp, j) : array.get(b1Px, j))
+                array.push(d1S, d1Score(j))
+    array<float> d1Out = array.new<float>()
+    int n1 = array.size(d1P)
+    if n1 > 0
+        array<bool> used1 = array.new<bool>(n1, false)
+        for it = 0 to n1 - 1
+            int bi = -1
+            float bs = -1e18
+            for q = 0 to n1 - 1
+                if not array.get(used1, q) and array.get(d1S, q) > bs
+                    bs := array.get(d1S, q)
+                    bi := q
+            if bi >= 0
+                array.set(used1, bi, true)
+                float px_ = array.get(d1P, bi)
+                bool okSep = true
+                if array.size(d1Out) > 0
+                    for q = 0 to array.size(d1Out) - 1
+                        if math.abs(px_ - array.get(d1Out, q)) <= px_ * B1_MINSEP
+                            okSep := false
+                if okSep
+                    array.push(d1Out, px_)
+    // ---- D3 promotion: single pass over members with per-cluster temps ----
+    float today = time / 86400000.0
+    int ncl = array.size(c3Sw)
+    array<float> d3Out = array.new<float>()
+    if ncl > 0 and array.size(m3Cid) > 0
+        array<int>   tNEp = array.new<int>(ncl, 0)
+        array<float> tPrv = array.new<float>(ncl, -1e18)
+        array<float> tEHW = array.new<float>(ncl, -1.0)
+        array<float> tEHP = array.new<float>(ncl, 0.0)
+        array<float> tEHD = array.new<float>(ncl, 0.0)
+        array<float> tELW = array.new<float>(ncl, -1.0)
+        array<float> tELP = array.new<float>(ncl, 0.0)
+        array<float> tELD = array.new<float>(ncl, 0.0)
+        array<float> tDw  = array.new<float>(ncl, 0.0)
+        array<float> tMin = array.new<float>(ncl, 1e18)
+        array<float> tMax = array.new<float>(ncl, -1e18)
+        array<float> tFD  = array.new<float>(ncl, 1e18)
+        array<float> tLD  = array.new<float>(ncl, -1e18)
+        array<float> tHiW = array.new<float>(ncl, 0.0)
+        array<float> tLoW = array.new<float>(ncl, 0.0)
+        for m = 0 to array.size(m3Cid) - 1
+            int k = array.get(m3Cid, m)
+            if array.get(c3Sw, k) > 0
+                float mday = array.get(m3Day, m)
+                if mday - array.get(tPrv, k) >= D3_EPGAP
+                    // flush the cluster's previous episode
+                    if array.get(tEHW, k) > 0
+                        float wd = array.get(tEHW, k) * math.pow(2.0, -(today - array.get(tEHD, k)) / D3_HL)
+                        array.set(tDw, k, array.get(tDw, k) + wd)
+                        array.set(tHiW, k, array.get(tHiW, k) + wd)
+                        array.set(tMin, k, math.min(array.get(tMin, k), array.get(tEHP, k)))
+                        array.set(tMax, k, math.max(array.get(tMax, k), array.get(tEHP, k)))
+                        array.set(tFD, k, math.min(array.get(tFD, k), array.get(tEHD, k)))
+                        array.set(tLD, k, math.max(array.get(tLD, k), array.get(tEHD, k)))
+                    if array.get(tELW, k) > 0
+                        float wd = array.get(tELW, k) * math.pow(2.0, -(today - array.get(tELD, k)) / D3_HL)
+                        array.set(tDw, k, array.get(tDw, k) + wd)
+                        array.set(tLoW, k, array.get(tLoW, k) + wd)
+                        array.set(tMin, k, math.min(array.get(tMin, k), array.get(tELP, k)))
+                        array.set(tMax, k, math.max(array.get(tMax, k), array.get(tELP, k)))
+                        array.set(tFD, k, math.min(array.get(tFD, k), array.get(tELD, k)))
+                        array.set(tLD, k, math.max(array.get(tLD, k), array.get(tELD, k)))
+                    array.set(tNEp, k, array.get(tNEp, k) + 1)
+                    array.set(tEHW, k, -1.0)
+                    array.set(tELW, k, -1.0)
+                array.set(tPrv, k, mday)
+                if array.get(m3Dir, m) > 0
+                    if array.get(m3W, m) > array.get(tEHW, k)
+                        array.set(tEHW, k, array.get(m3W, m))
+                        array.set(tEHP, k, array.get(m3Px, m))
+                        array.set(tEHD, k, mday)
+                else
+                    if array.get(m3W, m) > array.get(tELW, k)
+                        array.set(tELW, k, array.get(m3W, m))
+                        array.set(tELP, k, array.get(m3Px, m))
+                        array.set(tELD, k, mday)
+        // final flush + gates -> candidates
+        array<float> q3P  = array.new<float>()
+        array<float> q3S  = array.new<float>()
+        array<float> q3Mn = array.new<float>()
+        array<float> q3Mx = array.new<float>()
+        array<float> q3Hw = array.new<float>()
+        array<float> q3Lw = array.new<float>()
+        for k = 0 to ncl - 1
+            if array.get(c3Sw, k) > 0
+                if array.get(tEHW, k) > 0
+                    float wd = array.get(tEHW, k) * math.pow(2.0, -(today - array.get(tEHD, k)) / D3_HL)
+                    array.set(tDw, k, array.get(tDw, k) + wd)
+                    array.set(tHiW, k, array.get(tHiW, k) + wd)
+                    array.set(tMin, k, math.min(array.get(tMin, k), array.get(tEHP, k)))
+                    array.set(tMax, k, math.max(array.get(tMax, k), array.get(tEHP, k)))
+                    array.set(tFD, k, math.min(array.get(tFD, k), array.get(tEHD, k)))
+                    array.set(tLD, k, math.max(array.get(tLD, k), array.get(tEHD, k)))
+                if array.get(tELW, k) > 0
+                    float wd = array.get(tELW, k) * math.pow(2.0, -(today - array.get(tELD, k)) / D3_HL)
+                    array.set(tDw, k, array.get(tDw, k) + wd)
+                    array.set(tLoW, k, array.get(tLoW, k) + wd)
+                    array.set(tMin, k, math.min(array.get(tMin, k), array.get(tELP, k)))
+                    array.set(tMax, k, math.max(array.get(tMax, k), array.get(tELP, k)))
+                    array.set(tFD, k, math.min(array.get(tFD, k), array.get(tELD, k)))
+                    array.set(tLD, k, math.max(array.get(tLD, k), array.get(tELD, k)))
+                if array.get(tEHW, k) > 0 or array.get(tELW, k) > 0
+                    array.set(tNEp, k, array.get(tNEp, k) + 1)
+                float thruNow = array.get(c3Thru, k) * math.pow(2.0, -(today - array.get(c3ThruD, k)) / D3_THRUHL)
+                if array.get(tNEp, k) >= D3_K and
+                     array.get(tLD, k) - array.get(tFD, k) >= D3_SPAN and
+                     array.get(tDw, k) >= D3_WMIN and
+                     thruNow / math.max(1, array.get(tNEp, k)) <= D3_THRUMAX
+                    array.push(q3P, (array.get(tMin, k) + array.get(tMax, k)) / 2.0)
+                    array.push(q3S, array.get(tDw, k))
+                    array.push(q3Mn, array.get(tMin, k))
+                    array.push(q3Mx, array.get(tMax, k))
+                    array.push(q3Hw, array.get(tHiW, k))
+                    array.push(q3Lw, array.get(tLoW, k))
+        // flip-pair candidates
+        int n3 = array.size(q3P)
+        if n3 > 1
+            array<int> ord3 = array.new<int>()
+            array<bool> used3 = array.new<bool>(n3, false)
+            for it = 0 to n3 - 1
+                int bi = -1
+                float bp = 1e18
+                for q = 0 to n3 - 1
+                    if not array.get(used3, q) and array.get(q3P, q) < bp
+                        bp := array.get(q3P, q)
+                        bi := q
+                if bi >= 0
+                    array.set(used3, bi, true)
+                    array.push(ord3, bi)
+            for a = 0 to array.size(ord3) - 2
+                int lo_ = array.get(ord3, a)
+                int hi_ = array.get(ord3, a + 1)
+                float gapPx = array.get(q3Mn, hi_) - array.get(q3Mx, lo_)
+                if gapPx > 0 and gapPx <= D3_PAIRGAP * array.get(q3Mx, lo_) and
+                     array.get(q3Hw, lo_) > 0 and array.get(q3Lw, hi_) > 0
+                    array.push(q3P, (array.get(q3Mx, lo_) + array.get(q3Mn, hi_)) / 2.0)
+                    array.push(q3S, D3_PAIRBST * (array.get(q3Hw, lo_) + array.get(q3Lw, hi_)))
+                    array.push(q3Mn, float(na))
+                    array.push(q3Mx, float(na))
+                    array.push(q3Hw, 0.0)
+                    array.push(q3Lw, 0.0)
+        // greedy keep
+        int n3b = array.size(q3P)
+        if n3b > 0
+            array<bool> used3b = array.new<bool>(n3b, false)
+            for it = 0 to n3b - 1
+                int bi = -1
+                float bs = -1e18
+                for q = 0 to n3b - 1
+                    if not array.get(used3b, q) and array.get(q3S, q) > bs
+                        bs := array.get(q3S, q)
+                        bi := q
+                if bi >= 0
+                    array.set(used3b, bi, true)
+                    float px_ = array.get(q3P, bi)
+                    bool okSep = true
+                    int nNear = 0
+                    if array.size(d3Out) > 0
+                        for q = 0 to array.size(d3Out) - 1
+                            float kp = array.get(d3Out, q)
+                            if math.abs(px_ - kp) <= px_ * D3_MINSEP
+                                okSep := false
+                            if math.abs(px_ - kp) <= px_ * 0.0060
+                                nNear += 1
+                    if okSep and nNear < D3_CAPM
+                        array.push(d3Out, px_)
+    // ---- SYNTHESIS: consensus clusters, TIER-2 ONLY (both detectors) ------
+    array<float> pP = array.new<float>()
+    array<int>  pSrc = array.new<int>()
+    if array.size(d1Out) > 0
+        for q = 0 to array.size(d1Out) - 1
+            array.push(pP, array.get(d1Out, q))
+            array.push(pSrc, 1)
+    if array.size(d3Out) > 0
+        for q = 0 to array.size(d3Out) - 1
+            array.push(pP, array.get(d3Out, q))
+            array.push(pSrc, 3)
+    int np = array.size(pP)
+    array<float> cP = array.new<float>()
+    array<int>  cT = array.new<int>()
+    if np > 0
+        array<bool> usedP = array.new<bool>(np, false)
+        float cSum = 0.0
+        int   cN = 0
+        bool  c1 = false
+        bool  c3f = false
+        for it = 0 to np - 1
+            int bi = -1
+            float bp = 1e18
+            for q = 0 to np - 1
+                if not array.get(usedP, q) and array.get(pP, q) < bp
+                    bp := array.get(pP, q)
+                    bi := q
+            if bi >= 0
+                array.set(usedP, bi, true)
+                float px_ = array.get(pP, bi)
+                if cN > 0 and px_ - cSum / cN <= SYN_TOL * px_
+                    cSum += px_
+                    cN += 1
+                    if array.get(pSrc, bi) == 1
+                        c1 := true
+                    else
+                        c3f := true
+                else
+                    if cN > 0
+                        array.push(cP, cSum / cN)
+                        array.push(cT, c1 and c3f ? 2 : 1)
+                    cSum := px_
+                    cN := 1
+                    c1 := array.get(pSrc, bi) == 1
+                    c3f := array.get(pSrc, bi) == 3
+        if cN > 0
+            array.push(cP, cSum / cN)
+            array.push(cT, c1 and c3f ? 2 : 1)
+    float rlo = na
+    float rhi = na
+    int nd = array.size(dKey)
+    if nd > 0
+        for q = math.max(0, nd - SYN_RANGED) to nd - 1
+            rlo := na(rlo) ? array.get(dLo, q) : math.min(rlo, array.get(dLo, q))
+            rhi := na(rhi) ? array.get(dHi, q) : math.max(rhi, array.get(dHi, q))
+    int inRange = 0
+    int ncc = array.size(cP)
+    if ncc > 0
+        for q = 0 to ncc - 1
+            if array.get(cT, q) == 2                      // highest-confidence only
+                float px_ = array.get(cP, q)
+                bool okSep = true
+                if array.size(outP) > 0
+                    for w = 0 to array.size(outP) - 1
+                        if math.abs(px_ - array.get(outP, w)) <= px_ * SYN_MINSEP
+                            okSep := false
+                bool inR = not na(rlo) and px_ >= rlo and px_ <= rhi
+                if okSep and (not inR or inRange < SYN_CAP)
+                    array.push(outP, px_)
+                    array.push(outT, 2)
+                    if inR
+                        inRange += 1
+    true
+
 // ────────────────────────────────────────────────────────────────────────────
 // Strategy indicators (must be computed on every bar for series consistency)
 // ────────────────────────────────────────────────────────────────────────────
@@ -638,6 +923,7 @@ float emaF  = ta.ema(close, 20)
 float emaS  = ta.ema(close, 50)
 float emaXL = ta.ema(close, 200)
 float emaDl = ta.ema(close, 1920)      // ~20-day EMA proxy on 15m bars
+float rsi18 = ta.rsi(close, 18)
 [diPlus, diMinus, adxV] = ta.dmi(14, 14)
 bool  inRTH = not na(time(timeframe.period, "0930-1600", "America/New_York"))
 // v1.4 gates: no counter-trend A longs, no entries in chop
@@ -666,6 +952,8 @@ bool  aLong  = false
 bool  bLong  = false
 bool  bShort = false
 bool  cShort = false
+bool  rLong  = false
+bool  rShort = false
 float sigStop  = na
 float sigLimit = na
 // closedtrades guard: no reentry on the same bar an intrabar exit filled
@@ -802,6 +1090,33 @@ if barstate.isconfirmed
                     sigLimit := close - rrC * riskC
                     if close - gt >= 0.4 * riskC
                         sigLimit := gt                     // target the gap fill
+
+    // ---- Component R (the trader's rule): RSI-extreme rejection of a just-
+    // broken tier-2 boundary line. Short: RSI(18) >= 65 and this bar breaks
+    // above the nearest line; long: RSI(18) <= 30 and it breaks below.
+    if enableR and canTrade and not aLong and not bLong and not bShort and not cShort and sane and array.size(trdP) > 0
+        float rB = na
+        float sB = na
+        for q = 0 to array.size(trdP) - 1
+            float px_ = array.get(trdP, q)
+            if px_ > close[1]
+                rB := na(rB) ? px_ : math.min(rB, px_)
+            else
+                sB := na(sB) ? px_ : math.max(sB, px_)
+        if not na(rB) and rsi18 >= rsiShortMin and high >= rB
+            rShort  := true
+            sigStop := math.max(high, rB) * (1 + rPadPct / 100.0)
+            float riskR = sigStop - close
+            sigLimit := close - rrR * riskR
+            if not na(sB) and close - sB >= 0.5 * riskR
+                sigLimit := sB
+        else if not na(sB) and rsi18 <= rsiLongMax and low <= sB
+            rLong   := true
+            sigStop := math.min(low, sB) * (1 - rPadPct / 100.0)
+            float riskR = close - sigStop
+            sigLimit := close + rrR * riskR
+            if not na(rB) and rB - close >= 0.5 * riskR
+                sigLimit := rB
 
 // ────────────────────────────────────────────────────────────────────────────
 // Per-bar book update (closed bars only)
@@ -1061,6 +1376,11 @@ if barstate.isconfirmed
                 z3Dir := 1
                 z3RunPx := bhi4
                 z3RunD := day4
+        // refresh the tier-2 trading line set every 24 completed 4h buckets
+        synthPend += 1
+        if synthPend >= 24
+            bSynthInto(trdP, trdT)
+            synthPend := 0
         prevC4 := g4C
         g4Key := k4
         g4O := open
@@ -1097,6 +1417,16 @@ if cShort
     strategy.exit("C-Sx", "C-S", stop = sigStop, limit = sigLimit)
     lastEntryBar := bar_index
     entryBarIdx  := bar_index
+if rShort
+    strategy.entry("R-S", strategy.short)
+    strategy.exit("R-Sx", "R-S", stop = sigStop, limit = sigLimit)
+    lastEntryBar := bar_index
+    entryBarIdx  := bar_index
+if rLong
+    strategy.entry("R-L", strategy.long)
+    strategy.exit("R-Lx", "R-L", stop = sigStop, limit = sigLimit)
+    lastEntryBar := bar_index
+    entryBarIdx  := bar_index
 
 // B timeout: flat-close a stale momentum position at the bar close
 if barstate.isconfirmed and inPosB and strategy.position_size != 0 and bar_index - entryBarIdx >= timeoutB
@@ -1112,6 +1442,10 @@ if bShort
     alert("AutoLevels B: big-body momentum short", alert.freq_once_per_bar_close)
 if cShort
     alert("AutoLevels C: rejection short, FVG target", alert.freq_once_per_bar_close)
+if rShort
+    alert("AutoLevels R: RSI rejection short at boundary line", alert.freq_once_per_bar_close)
+if rLong
+    alert("AutoLevels R: RSI rejection long at boundary line", alert.freq_once_per_bar_close)
 
 // ────────────────────────────────────────────────────────────────────────────
 // Drawing — recompute the emitted set on the last bar
@@ -1131,269 +1465,9 @@ if barstate.islast or barstate.islastconfirmedhistory
             label.delete(array.get(lvLabels, j))
     array.clear(lvLabels)
 
-    // ---- D1 emission: gates + score, then greedy min-sep in score order ----
-    array<float> d1P = array.new<float>()
-    array<float> d1S = array.new<float>()
-    if b1Count() > 0
-        for j = 0 to b1Count() - 1
-            int eps_  = array.get(b1Eps, j)
-            int zone_ = array.get(b1Zone, j)
-            int ca_   = array.get(b1Ca, j)
-            int cb_   = array.get(b1Cb, j)
-            bool pass = eps_ >= B1_MINEP and array.get(b1Dep, j) >= B1_MINDEP and
-                 zone_ >= B1_ZONEMIN and
-                 zone_ / math.max(1, eps_) <= B1_DWELLMX and
-                 array.get(b1Bt, j) / math.max(1, zone_) <= B1_BTMAX and
-                 math.min(ca_, cb_) >= B1_FLIPMIN and
-                 array.get(b1Last, j) - array.get(b1First, j) >= B1_SPANMIN
-            if pass
-                array.push(d1P, array.get(b1NSmp, j) > 0 ?
-                     array.get(b1Sum, j) / array.get(b1NSmp, j) : array.get(b1Px, j))
-                array.push(d1S, d1Score(j))
-    array<float> d1Out = array.new<float>()
-    int n1 = array.size(d1P)
-    if n1 > 0
-        array<bool> used1 = array.new<bool>(n1, false)
-        for it = 0 to n1 - 1
-            int bi = -1
-            float bs = -1e18
-            for q = 0 to n1 - 1
-                if not array.get(used1, q) and array.get(d1S, q) > bs
-                    bs := array.get(d1S, q)
-                    bi := q
-            if bi >= 0
-                array.set(used1, bi, true)
-                float px_ = array.get(d1P, bi)
-                bool okSep = true
-                if array.size(d1Out) > 0
-                    for q = 0 to array.size(d1Out) - 1
-                        if math.abs(px_ - array.get(d1Out, q)) <= px_ * B1_MINSEP
-                            okSep := false
-                if okSep
-                    array.push(d1Out, px_)
-
-    // ---- D3 promotion: episode-collapse each cluster, then flip pairs -----
-    float today = time / 86400000.0
-    array<float> q3P  = array.new<float>()   // candidate price
-    array<float> q3S  = array.new<float>()   // candidate score
-    array<float> q3Mn = array.new<float>()   // cluster min rep (na for pairs)
-    array<float> q3Mx = array.new<float>()
-    array<float> q3Hw = array.new<float>()   // decayed hi-rep weight
-    array<float> q3Lw = array.new<float>()
-    int ncl = array.size(c3Sw)
-    int nmm = array.size(m3Cid)
-    if ncl > 0 and nmm > 0
-        for k = 0 to ncl - 1
-            if array.get(c3Sw, k) > 0
-                int   nEp = 0
-                float prevDay = -1e18
-                float epHiW = -1.0
-                float epHiPx = na
-                float epHiD = na
-                float epLoW = -1.0
-                float epLoPx = na
-                float epLoD = na
-                float dw = 0.0
-                float minRep = 1e18
-                float maxRep = -1e18
-                float firstRepD = 1e18
-                float lastRepD = -1e18
-                float hiW = 0.0
-                float loW = 0.0
-                for m = 0 to nmm - 1
-                    if array.get(m3Cid, m) == k
-                        float mday = array.get(m3Day, m)
-                        if mday - prevDay >= D3_EPGAP
-                            // flush previous episode's representatives
-                            if epHiW > 0
-                                float wd = epHiW * math.pow(2.0, -(today - epHiD) / D3_HL)
-                                dw += wd
-                                hiW += wd
-                                minRep := math.min(minRep, epHiPx)
-                                maxRep := math.max(maxRep, epHiPx)
-                                firstRepD := math.min(firstRepD, epHiD)
-                                lastRepD := math.max(lastRepD, epHiD)
-                            if epLoW > 0
-                                float wd = epLoW * math.pow(2.0, -(today - epLoD) / D3_HL)
-                                dw += wd
-                                loW += wd
-                                minRep := math.min(minRep, epLoPx)
-                                maxRep := math.max(maxRep, epLoPx)
-                                firstRepD := math.min(firstRepD, epLoD)
-                                lastRepD := math.max(lastRepD, epLoD)
-                            nEp += 1
-                            epHiW := -1.0
-                            epLoW := -1.0
-                        prevDay := mday
-                        if array.get(m3Dir, m) > 0
-                            if array.get(m3W, m) > epHiW
-                                epHiW := array.get(m3W, m)
-                                epHiPx := array.get(m3Px, m)
-                                epHiD := mday
-                        else
-                            if array.get(m3W, m) > epLoW
-                                epLoW := array.get(m3W, m)
-                                epLoPx := array.get(m3Px, m)
-                                epLoD := mday
-                // flush the final episode
-                if epHiW > 0
-                    float wd = epHiW * math.pow(2.0, -(today - epHiD) / D3_HL)
-                    dw += wd
-                    hiW += wd
-                    minRep := math.min(minRep, epHiPx)
-                    maxRep := math.max(maxRep, epHiPx)
-                    firstRepD := math.min(firstRepD, epHiD)
-                    lastRepD := math.max(lastRepD, epHiD)
-                if epLoW > 0
-                    float wd = epLoW * math.pow(2.0, -(today - epLoD) / D3_HL)
-                    dw += wd
-                    loW += wd
-                    minRep := math.min(minRep, epLoPx)
-                    maxRep := math.max(maxRep, epLoPx)
-                    firstRepD := math.min(firstRepD, epLoD)
-                    lastRepD := math.max(lastRepD, epLoD)
-                float thruNow = array.get(c3Thru, k) * math.pow(2.0, -(today - array.get(c3ThruD, k)) / D3_THRUHL)
-                if nEp >= D3_K and lastRepD - firstRepD >= D3_SPAN and dw >= D3_WMIN and
-                     thruNow / math.max(1, nEp) <= D3_THRUMAX
-                    array.push(q3P, (minRep + maxRep) / 2.0)
-                    array.push(q3S, dw)
-                    array.push(q3Mn, minRep)
-                    array.push(q3Mx, maxRep)
-                    array.push(q3Hw, hiW)
-                    array.push(q3Lw, loW)
-    // flip-pair candidates from price-adjacent promoted clusters
-    int n3 = array.size(q3P)
-    if n3 > 1
-        array<int> ord3 = array.new<int>()
-        array<bool> used3 = array.new<bool>(n3, false)
-        for it = 0 to n3 - 1
-            int bi = -1
-            float bp = 1e18
-            for q = 0 to n3 - 1
-                if not array.get(used3, q) and array.get(q3P, q) < bp
-                    bp := array.get(q3P, q)
-                    bi := q
-            if bi >= 0
-                array.set(used3, bi, true)
-                array.push(ord3, bi)
-        for a = 0 to array.size(ord3) - 2
-            int lo_ = array.get(ord3, a)
-            int hi_ = array.get(ord3, a + 1)
-            float gapPx = array.get(q3Mn, hi_) - array.get(q3Mx, lo_)
-            if gapPx > 0 and gapPx <= D3_PAIRGAP * array.get(q3Mx, lo_) and
-                 array.get(q3Hw, lo_) > 0 and array.get(q3Lw, hi_) > 0
-                array.push(q3P, (array.get(q3Mx, lo_) + array.get(q3Mn, hi_)) / 2.0)
-                array.push(q3S, D3_PAIRBST * (array.get(q3Hw, lo_) + array.get(q3Lw, hi_)))
-                array.push(q3Mn, float(na))
-                array.push(q3Mx, float(na))
-                array.push(q3Hw, 0.0)
-                array.push(q3Lw, 0.0)
-    // greedy keep: desc score, min-sep 0.20%, <= 2 kept per ±0.60%
-    array<float> d3Out = array.new<float>()
-    int n3b = array.size(q3P)
-    if n3b > 0
-        array<bool> used3b = array.new<bool>(n3b, false)
-        for it = 0 to n3b - 1
-            int bi = -1
-            float bs = -1e18
-            for q = 0 to n3b - 1
-                if not array.get(used3b, q) and array.get(q3S, q) > bs
-                    bs := array.get(q3S, q)
-                    bi := q
-            if bi >= 0
-                array.set(used3b, bi, true)
-                float px_ = array.get(q3P, bi)
-                bool okSep = true
-                int nNear = 0
-                if array.size(d3Out) > 0
-                    for q = 0 to array.size(d3Out) - 1
-                        float kp = array.get(d3Out, q)
-                        if math.abs(px_ - kp) <= px_ * D3_MINSEP
-                            okSep := false
-                        if math.abs(px_ - kp) <= px_ * 0.0060
-                            nNear += 1
-                if okSep and nNear < D3_CAPM
-                    array.push(d3Out, px_)
-
-    // ---- SYNTHESIS: pool D1+D3, mean-linkage cluster, rank, cap ----------
-    array<float> pP = array.new<float>()
-    array<int>  pSrc = array.new<int>()
-    if array.size(d1Out) > 0
-        for q = 0 to array.size(d1Out) - 1
-            array.push(pP, array.get(d1Out, q))
-            array.push(pSrc, 1)
-    if array.size(d3Out) > 0
-        for q = 0 to array.size(d3Out) - 1
-            array.push(pP, array.get(d3Out, q))
-            array.push(pSrc, 3)
-    // sort pool ascending (selection)
-    int np = array.size(pP)
-    array<float> cP = array.new<float>()     // cluster placement
-    array<int>  cT = array.new<int>()        // tier: 2 = both detectors
-    if np > 0
-        array<bool> usedP = array.new<bool>(np, false)
-        float cSum = 0.0
-        int   cN = 0
-        bool  c1 = false
-        bool  c3f = false
-        for it = 0 to np - 1
-            int bi = -1
-            float bp = 1e18
-            for q = 0 to np - 1
-                if not array.get(usedP, q) and array.get(pP, q) < bp
-                    bp := array.get(pP, q)
-                    bi := q
-            if bi >= 0
-                array.set(usedP, bi, true)
-                float px_ = array.get(pP, bi)
-                if cN > 0 and px_ - cSum / cN <= SYN_TOL * px_
-                    cSum += px_
-                    cN += 1
-                    if array.get(pSrc, bi) == 1
-                        c1 := true
-                    else
-                        c3f := true
-                else
-                    if cN > 0
-                        array.push(cP, cSum / cN)
-                        array.push(cT, c1 and c3f ? 2 : 1)
-                    cSum := px_
-                    cN := 1
-                    c1 := array.get(pSrc, bi) == 1
-                    c3f := array.get(pSrc, bi) == 3
-        if cN > 0
-            array.push(cP, cSum / cN)
-            array.push(cT, c1 and c3f ? 2 : 1)
-    // trailing 60-day range
-    float rlo = na
-    float rhi = na
-    int nd = array.size(dKey)
-    if nd > 0
-        for q = math.max(0, nd - SYN_RANGED) to nd - 1
-            rlo := na(rlo) ? array.get(dLo, q) : math.min(rlo, array.get(dLo, q))
-            rhi := na(rhi) ? array.get(dHi, q) : math.max(rhi, array.get(dHi, q))
-    // greedy emission: tier-2 first (ascending), then singletons desc price
     array<float> synP = array.new<float>()
     array<int>  synT = array.new<int>()
-    int inRange = 0
-    int ncc = array.size(cP)
-    if ncc > 0
-        for pass_ = 2 to 1
-            for step_ = 0 to ncc - 1
-                int q = pass_ == 2 ? step_ : ncc - 1 - step_
-                if array.get(cT, q) == pass_
-                    float px_ = array.get(cP, q)
-                    bool okSep = true
-                    if array.size(synP) > 0
-                        for w = 0 to array.size(synP) - 1
-                            if math.abs(px_ - array.get(synP, w)) <= px_ * SYN_MINSEP
-                                okSep := false
-                    bool inR = not na(rlo) and px_ >= rlo and px_ <= rhi
-                    if okSep and (not inR or inRange < SYN_CAP)
-                        array.push(synP, px_)
-                        array.push(synT, array.get(cT, q))
-                        if inR
-                            inRange += 1
+    bSynthInto(synP, synT)
 
     // ---- draw the boundary levels ----------------------------------------
     if array.size(synP) > 0
