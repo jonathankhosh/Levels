@@ -468,6 +468,7 @@ d1Step(int j, float o4, float h4, float l4, float c4, float pc4, int jbar) =>
                 if not na(ex2) and math.abs(ex2 - px) <= px * B1_INCL
                     array.set(b1NSmp, j, array.get(b1NSmp, j) + 1)
                     array.set(b1Sum, j, array.get(b1Sum, j) + ex2)
+    true    // uniform return type across all branches
 
 d1RemoveLevel(int j) =>
     array.remove(b1Px, j)
@@ -551,6 +552,7 @@ d1Pivot(float wick, float bodyEdge, int j4now) =>
                     ws := s
                     worst := j
             d1RemoveLevel(worst)
+    true    // uniform return type across all branches
 
 // D3: add a reversal event to the online clusters
 d3Add(float px, float day, int dir, float w) =>
@@ -625,6 +627,7 @@ d3Add(float px, float day, int dir, float w) =>
                     worst := k
         if worst != -1
             array.set(c3Sw, worst, 0.0)
+    true    // uniform return type across all branches
 
 // ────────────────────────────────────────────────────────────────────────────
 // Strategy indicators (must be computed on every bar for series consistency)
